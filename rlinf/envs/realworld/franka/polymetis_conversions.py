@@ -1,3 +1,17 @@
+# Copyright 2025 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Pure conversions between DROID polymetis zerorpc state/commands and the
 field/action conventions FrankaEnv expects. No rlinf imports — unit-testable
 without ray/torch.
@@ -10,6 +24,7 @@ droid-nuc-fr3 container):
 - DROID update_command action spaces: cartesian_position / joint_position /
   cartesian_velocity / joint_velocity. VERIFIED.
 - DROID gripper_position: float [0,1], 1 = closed.
+  Boundary: [0, 0.5) -> open; [0.5, 1] -> closed.
 - RLinf ARM path: `move_arm(position: 7D [x,y,z,qx,qy,qz,qw])` — ABSOLUTE
   impedance equilibrium target, one non-blocking call per env step.
   (`command_end_effector` is NOT the arm path — it is the gripper path.)
@@ -27,14 +42,20 @@ from scipy.spatial.transform import Rotation as R
 
 
 def droid_state_to_franka_fields(state: dict) -> dict:
+    """Convert DROID zerorpc state dict to FrankaRobotState field dict."""
     pos_euler = np.asarray(state["cartesian_position"], dtype=np.float64)
     quat = R.from_euler("xyz", pos_euler[3:6]).as_quat()
     grip_open, grip_pos = droid_gripper_to_rlinf(float(state["gripper_position"]))
+    jp = np.asarray(state["joint_positions"], dtype=np.float64)
+    jv = np.asarray(state["joint_velocities"], dtype=np.float64)
+    assert jp.shape == (7,) and jv.shape == (7,), (
+        f"expected 7D joints, got {jp.shape}/{jv.shape}"
+    )
     return {
         "tcp_pose": np.concatenate([pos_euler[:3], quat]),
         "tcp_vel": np.zeros(6),
-        "arm_joint_position": np.asarray(state["joint_positions"], dtype=np.float64),
-        "arm_joint_velocity": np.asarray(state["joint_velocities"], dtype=np.float64),
+        "arm_joint_position": jp,
+        "arm_joint_velocity": jv,
         "tcp_force": np.zeros(3),
         "tcp_torque": np.zeros(3),
         "arm_jacobian": np.zeros((6, 7)),  # FrankaEnv never reads it (verified)
@@ -44,6 +65,7 @@ def droid_state_to_franka_fields(state: dict) -> dict:
 
 
 def rlinf_ee_action_to_droid(target_pose_7d: np.ndarray) -> np.ndarray:
+    """7D absolute pose [xyz + quat xyzw] -> DROID 6D [xyz + euler-xyz]."""
     t = np.asarray(target_pose_7d, dtype=np.float64)
     assert t.shape == (7,), f"expected 7D pos+quat, got {t.shape}"
     euler = R.from_quat(t[3:7]).as_euler("xyz")
@@ -51,9 +73,11 @@ def rlinf_ee_action_to_droid(target_pose_7d: np.ndarray) -> np.ndarray:
 
 
 def droid_gripper_to_rlinf(droid_pos: float) -> tuple[bool, int]:
+    """DROID gripper float [0,1] (1=closed) -> (gripper_open, position 0-255)."""
     droid_pos = min(1.0, max(0.0, droid_pos))
     return droid_pos < 0.5, int(round(droid_pos * 255))
 
 
 def rlinf_gripper_to_droid(position_255: int) -> float:
+    """RLinf gripper position int 0-255 -> DROID command float [0,1]."""
     return min(1.0, max(0.0, position_255 / 255.0))
