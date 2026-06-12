@@ -103,6 +103,12 @@ class FrankaRobotConfig:
         1  # Default to 1 to maintain backward compatibility (immediate success)
     )
 
+    # -- Controller backend selection -------------------------------------
+    # "serl" selects the ROS1/serl FrankaController (default).
+    # "polymetis" selects the DROID zerorpc PolymetisController (no ROS,
+    # works on FR3 fw >= 5.9 with libfranka 0.18.1 in the DROID container).
+    controller_type: str = "serl"
+
     # -- End-effector selection -------------------------------------------
     # One of "franka_gripper", "robotiq_gripper", or "ruiyan_hand".
     end_effector_type: str = "franka_gripper"
@@ -223,8 +229,6 @@ class FrankaEnv(gym.Env):
         return self._task_description
 
     def _setup_hardware(self):
-        from .franka_controller import FrankaController
-
         assert self.env_idx >= 0, "env_idx must be set for FrankaEnv."
 
         # Setup Franka IP and camera serials
@@ -247,6 +251,13 @@ class FrankaEnv(gym.Env):
             self.config.gripper_connection = getattr(
                 self.hardware_info.config, "gripper_connection", None
             )
+        # Fall back to hardware_info for controller_type when the env config
+        # leaves it at the default "serl" (mirrors camera_type / gripper_type
+        # fallback pattern above).
+        if getattr(self.config, "controller_type", None) in (None, "serl"):
+            hw_ct = getattr(self.hardware_info.config, "controller_type", None)
+            if hw_ct:
+                self.config.controller_type = hw_ct
         self.config.end_effector_type = normalize_end_effector_type(
             self.config.end_effector_type,
             self.config.gripper_type,
@@ -260,7 +271,12 @@ class FrankaEnv(gym.Env):
         )
         if controller_node_rank is None:
             controller_node_rank = self.node_rank
-        self._controller = FrankaController.launch_controller(
+
+        if getattr(self.config, "controller_type", "serl") == "polymetis":
+            from .polymetis_controller import PolymetisController as _Ctrl
+        else:
+            from .franka_controller import FrankaController as _Ctrl
+        self._controller = _Ctrl.launch_controller(
             robot_ip=self.config.robot_ip,
             env_idx=self.env_idx,
             node_rank=controller_node_rank,

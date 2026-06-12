@@ -216,6 +216,11 @@ class FrankaConfig(HardwareConfig):
     worker.  Set this when the arm/gripper and cameras are on different
     machines (e.g. cameras on a GPU server, arm on a NUC)."""
 
+    controller_type: str = "serl"
+    """Controller backend: ``"serl"`` (ROS1/serl, default) or ``"polymetis"``
+    (DROID zerorpc, no ROS, requires FR3 fw >= 5.9 with libfranka 0.18.1
+    inside the DROID container at port 4242)."""
+
     disable_validate: bool = False
     """Whether to disable validation of robot IP connectivity and camera serials."""
 
