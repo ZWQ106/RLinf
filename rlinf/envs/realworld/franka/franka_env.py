@@ -104,10 +104,11 @@ class FrankaRobotConfig:
     )
 
     # -- Controller backend selection -------------------------------------
+    # None → hardware config wins, else explicit value wins; resolves to 'serl'.
     # "serl" selects the ROS1/serl FrankaController (default).
     # "polymetis" selects the DROID zerorpc PolymetisController (no ROS,
     # works on FR3 fw >= 5.9 with libfranka 0.18.1 in the DROID container).
-    controller_type: str = "serl"
+    controller_type: Optional[str] = None
 
     # -- End-effector selection -------------------------------------------
     # One of "franka_gripper", "robotiq_gripper", or "ruiyan_hand".
@@ -252,12 +253,13 @@ class FrankaEnv(gym.Env):
                 self.hardware_info.config, "gripper_connection", None
             )
         # Fall back to hardware_info for controller_type when the env config
-        # leaves it at the default "serl" (mirrors camera_type / gripper_type
-        # fallback pattern above).
-        if getattr(self.config, "controller_type", None) in (None, "serl"):
-            hw_ct = getattr(self.hardware_info.config, "controller_type", None)
-            if hw_ct:
-                self.config.controller_type = hw_ct
+        # leaves it at None (mirrors camera_type / gripper_type fallback pattern above).
+        if self.config.controller_type is None:
+            self.config.controller_type = getattr(
+                self.hardware_info.config, "controller_type", None
+            )
+        if not self.config.controller_type:
+            self.config.controller_type = "serl"
         self.config.end_effector_type = normalize_end_effector_type(
             self.config.end_effector_type,
             self.config.gripper_type,

@@ -28,6 +28,7 @@ full argument set as ``FrankaController`` (including ``ros_pkg``,
 call.  ROS-specific / end-effector-type args are accepted and ignored; this
 backend always drives the Robotiq 2F-85 gripper via DROID's zerorpc server.
 """
+import time
 from typing import Optional
 
 import numpy as np
@@ -95,9 +96,9 @@ class PolymetisController(Worker):
         # Mirror FrankaController.__init__: also obtain a named logger.
         self._logger = get_logger()
         self._robot_ip = robot_ip
-        # ros_pkg / end_effector_type / end_effector_config / gripper_type
-        # are accepted for interface parity with FrankaController but unused
-        # here — this backend always uses the DROID zerorpc Robotiq path.
+        # ros_pkg / end_effector_type / end_effector_config / gripper_type /
+        # gripper_connection are accepted for interface parity with FrankaController
+        # but unused here — this backend always uses the DROID zerorpc Robotiq path.
 
         self._client = DroidZerorpcClient(address=f"tcp://{robot_ip}:4242")
         self._client.bootstrap()  # idempotent; spawns polymetis + robotiq drivers
@@ -129,7 +130,9 @@ class PolymetisController(Worker):
 
     def move_arm(self, position: np.ndarray):
         """ABSOLUTE 7D pose target [xyz + quat xyzw] — one non-blocking
-        impedance-equilibrium update per env step (serl semantics)."""
+        impedance-equilibrium update per env step (serl semantics).
+
+        A wedged server raises zerorpc.TimeoutExpired after 5s (fast-client timeout) and the env step crashes — correct behavior; recover via recover()."""
         assert len(position) == 7, (
             f"Invalid position, expected 7 dimensions but got {len(position)}"
         )
@@ -163,11 +166,26 @@ class PolymetisController(Worker):
 
     # ---- joint reset -----------------------------------------------------
 
-    def reset_joint(self, reset_pos):
-        """Stream joint-position reset over 3 seconds."""
-        self._client.stream_joint_position(
-            reset_pos, duration_s=3.0, gripper_cmd=self._last_grip
-        )
+    def reset_joint(self, reset_pos, timeout_s: float = 15.0):
+        """Stream joint targets until convergence (atol 1e-2 rad) or timeout.
+
+        Re-streams in 1s chunks to keep re-asserting the setpoint while
+        waiting — mirrors serl's _wait_for_joint contract: when this
+        returns, the arm is AT the target (or we warned loudly).
+        """
+        target = np.asarray(reset_pos, dtype=np.float64)
+        deadline = time.monotonic() + timeout_s
+        while True:
+            self._client.stream_joint_position(target, duration_s=1.0,
+                                               gripper_cmd=self._last_grip)
+            q = self._client.get_robot_state()["joint_positions"]
+            if np.allclose(target, q, atol=1e-2):
+                return
+            if time.monotonic() > deadline:
+                self.log_warning(
+                    f"reset_joint not converged after {timeout_s}s: q={q}"
+                )
+                return
 
     # ---- compliance / error handling ------------------------------------
 
@@ -186,7 +204,6 @@ class PolymetisController(Worker):
     def recover(self) -> None:
         """Full DROID controller relaunch — for reflex/error recovery only."""
         self._client.kill_controller()
-        self._client._bootstrapped = False
         self._client.bootstrap()
 
     # ---- impedance lifecycle (no-op: always running in DROID) -----------
@@ -200,11 +217,19 @@ class PolymetisController(Worker):
     # ---- gripper helpers -------------------------------------------------
 
     def open_gripper(self) -> None:
+        # Deliberately update the cache BEFORE the blocking RPC: move_arm
+        # re-asserts _last_grip at ~15 Hz, so on a response-lost timeout
+        # where the gripper DID move, post-update would stream the stale
+        # command and reopen mid-grasp. Pre-update converges to intent.
         self._last_grip = 0.0
         self._client.update_gripper(0.0, blocking=True)
         self.log_debug("Open gripper")
 
     def close_gripper(self) -> None:
+        # Deliberately update the cache BEFORE the blocking RPC: move_arm
+        # re-asserts _last_grip at ~15 Hz, so on a response-lost timeout
+        # where the gripper DID move, post-update would stream the stale
+        # command and reopen mid-grasp. Pre-update converges to intent.
         self._last_grip = 1.0
         self._client.update_gripper(1.0, blocking=True)
         self.log_debug("Close gripper")
