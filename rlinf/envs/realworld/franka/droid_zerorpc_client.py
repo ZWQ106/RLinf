@@ -33,7 +33,8 @@ run_server.py. Key design facts preserved:
 """
 import time
 import logging
-from typing import Optional, Sequence
+import threading
+from typing import Sequence
 
 import numpy as np
 import zerorpc
@@ -54,7 +55,6 @@ class DroidZerorpcClient:
         timeout: int = 30,
         fast_timeout: int = 5,
     ):
-        self._addr = address
         # Long-timeout connection: bootstrap (launch_controller ~10s) and
         # blocking moves (one-shot positions can take several seconds).
         self._client = zerorpc.Client(heartbeat=heartbeat, timeout=timeout)
@@ -66,11 +66,22 @@ class DroidZerorpcClient:
         self._fast = zerorpc.Client(heartbeat=heartbeat, timeout=fast_timeout)
         self._fast.connect(address)
         self._bootstrapped = False
+        self._owner_thread = threading.get_ident()
         _log.info("droid client connected to %s", address)
 
     @property
     def bootstrapped(self) -> bool:
         return self._bootstrapped
+
+    def _check_thread(self) -> None:
+        # gevent hubs are thread-local: zerorpc calls from a thread other
+        # than the creating one die with an opaque LoopExit. Fail loudly
+        # instead. If another thread needs a client, it must create its own.
+        if threading.get_ident() != self._owner_thread:
+            raise RuntimeError(
+                "DroidZerorpcClient used from a different thread than the one "
+                "that created it; create a separate client in that thread"
+            )
 
     # ---- lifecycle ----
 
@@ -81,6 +92,7 @@ class DroidZerorpcClient:
         Idempotent. First call takes ~10s. Subsequent calls are no-ops.
         Must be called before any motion or state read.
         """
+        self._check_thread()
         if self._bootstrapped:
             return
         _log.info("bootstrap step 1/3: launch_controller (spawn polymetis driver)")
@@ -104,6 +116,7 @@ class DroidZerorpcClient:
     def get_robot_state(self) -> dict:
         """Flat state dict with joint positions, velocities, torques, EE pose,
         gripper, and timestamp. Unwraps DROID's [state, ts] 2-list."""
+        self._check_thread()
         st_pair = self._fast.get_robot_state()
         state, ts = st_pair[0], st_pair[1]
         # Normalize to numpy for caller convenience.
@@ -148,6 +161,7 @@ class DroidZerorpcClient:
         get the default action_space="cartesian_velocity", which IK-solves
         into completely different joint motion. Always use positional args.
         """
+        self._check_thread()
         action_list = [float(x) for x in np.asarray(action_8d, dtype=np.float64)]
         assert len(action_list) == 8, f"expected 8-D action, got {len(action_list)}"
         # POSITIONAL args. Arg 3 = gripper_action_space = "position". DROID's
@@ -173,12 +187,13 @@ class DroidZerorpcClient:
             gripper_cmd: gripper command (0=open, 1=close).
             blocking: True for one-shot moves (robot waits). False for streaming.
         """
+        self._check_thread()
         q = [float(x) for x in np.asarray(target_q_7d, dtype=np.float64)]
         assert len(q) == 7, f"expected 7 joint targets, got {len(q)}"
         action = q + [float(gripper_cmd)]
         self._client.update_command(action, "joint_position", None, blocking)
 
-    def update_cartesian_position(self, pose_6d, gripper_cmd: float = 0.0) -> None:
+    def update_cartesian_position(self, pose_6d: Sequence[float], gripper_cmd: float = 0.0) -> None:
         """One non-blocking absolute EE target. 6D [xyz + euler-xyz] + gripper.
 
         Args:
@@ -188,11 +203,12 @@ class DroidZerorpcClient:
         Note: kwargs over zerorpc are silently dropped by this server version —
         always positional args to update_command.
         """
+        self._check_thread()
         a = [float(x) for x in pose_6d] + [float(gripper_cmd)]
         assert len(a) == 7
         self._fast.update_command(a, "cartesian_position", "position", False)
 
-    def stream_joint_position(self, q7, duration_s: float = 2.0, hz: int = 15,
+    def stream_joint_position(self, q7: Sequence[float], duration_s: float = 2.0, hz: int = 15,
                               gripper_cmd: float = 0.0) -> None:
         """Streamed joint reset — a blocking one-shot is a no-op for small
         displacement (DROID adaptive_time_to_go=0 gotcha).
@@ -203,6 +219,10 @@ class DroidZerorpcClient:
             hz: streaming rate in Hz.
             gripper_cmd: gripper command (0=open, 1=close).
 
+        Streams on the fast (5s) connection — a wedged server stalls a tick by
+        at most 5s. Per-tick pacing ignores RPC RTT, so effective rate is
+        slightly below hz; fine for resets.
+
         Why streaming instead of blocking one-shot: DROID's adaptive_time_to_go()
         returns 0 for small displacements (default t_min=0), and polymetis
         `move_to_joint_positions(q, t=0)` becomes a no-op. So going to a pose
@@ -210,10 +230,11 @@ class DroidZerorpcClient:
         absolute target at 15 Hz with cartesian impedance running converges
         reliably regardless of starting distance.
         """
+        self._check_thread()
         a = [float(x) for x in q7] + [float(gripper_cmd)]
         assert len(a) == 8
         for _ in range(int(duration_s * hz)):
-            self._client.update_command(a, "joint_position", "position", False)
+            self._fast.update_command(a, "joint_position", "position", False)
             time.sleep(1.0 / hz)
 
     # ---- gripper standalone ----
@@ -225,6 +246,7 @@ class DroidZerorpcClient:
             command: gripper position command (0=open, 1=close), clipped to [0,1].
             blocking: True for one-shot. False for streaming.
         """
+        self._check_thread()
         cmd = float(np.clip(command, 0.0, 1.0))
         # POSITIONAL args: command, velocity, blocking
         self._client.update_gripper(cmd, False, blocking)
@@ -233,6 +255,7 @@ class DroidZerorpcClient:
 
     def kill_controller(self) -> None:
         """Tear down polymetis driver. Future commands will need bootstrap()."""
+        self._check_thread()
         try:
             self._client.kill_controller()
         finally:
