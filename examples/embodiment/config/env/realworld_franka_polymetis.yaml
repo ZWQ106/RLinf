@@ -1,0 +1,114 @@
+env_type: realworld
+
+total_num_envs: 1
+
+auto_reset: False
+ignore_terminations: False
+reward_mode: raw
+wrap_obs_mode: simple
+seed: 0
+group_size: 1
+use_fixed_reset_state_ids: False
+max_steps_per_rollout_epoch: 300
+max_episode_steps: 300
+use_spacemouse: True
+main_image_key: wrist_1
+
+video_cfg:
+  save_video: False
+  info_on_video: True
+  video_base_dir: ${runner.logger.log_path}/video/eval
+
+init_params:
+  id: "FrankaEnv-v1"
+  num_envs: null
+
+override_cfg:
+  # Task description shown to VLA policy (placeholder — update before real runs).
+  task_description: "pick up the cube"
+  # Polymetis backend: gripper is driven by DROID's zerorpc server on NUC.
+  # No local serial device — gripper_connection must be null.
+  gripper_type: "robotiq"
+  gripper_connection: null
+  controller_type: "polymetis"
+  # Camera type matches the ZED 2i / ZED Mini hardware on TASL-1 Desktop.
+  camera_type: "zed"
+  # Serial order: exterior ZED 2i first (wrist_1), wrist ZED Mini second (wrist_2).
+  camera_serials:
+    - "36443134"
+    - "17150101"
+
+  # Reset/home joint pose: DROID home [q1..q7] in radians.
+  joint_reset_qpos: [0.0, -0.6283, 0.0, -2.5133, 0.0, 1.8850, 0.0]
+
+  # EE reset pose [x, y, z, rx, ry, rz] above table — safe approach height.
+  # TODO(P1): measure with get_tcp_pose() and update.
+  reset_ee_pose: [0.5, 0.0, 0.2, -3.14, 0.0, 0.0]
+
+  # Target EE pose for success-checking and orientation clipping.
+  # TODO(P1): measure with get_tcp_pose() at grasp commit and update.
+  target_ee_pose: [0.5, 0.0, 0.1, -3.14, 0.0, 0.0]
+
+  max_num_steps: 300
+
+  # Position success tolerance [x, y, z, rx, ry, rz]; FrankaEnv checks xyz only.
+  reward_threshold: [0.01, 0.01, 0.01, 0.2, 0.2, 0.2]
+
+  # Success hold steps (set > 1 to require temporal consistency).
+  success_hold_steps: 1
+
+  # Gripper penalty disabled for data-collection runs.
+  enable_gripper_penalty: false
+
+  # [xyz delta scale, rpy delta scale, gripper scale] — serl defaults.
+  # TODO(P1): tune after first hardware measurements.
+  action_scale: [1.0, 1.0, 1.0]
+
+  # Workspace safety box [x, y, z, rx, ry, rz] — serl defaults; tune via P1.
+  ee_pose_limit_min: [0.25, -0.35, 0.03, -3.64, -0.5, -0.5]
+  ee_pose_limit_max: [0.75, 0.35, 0.40, -2.64, 0.5, 0.5]
+
+  # Step frequency (Hz) — serl default; polymetis backend honors this via sleep.
+  step_frequency: 10.0
+
+  # Compliance and precision params are ROS/serl concepts; polymetis backend
+  # logs and ignores them.  Kept so the config is valid if the backend is
+  # swapped back to serl.
+  compliance_param:
+    translational_stiffness: 2000
+    translational_damping: 89
+    rotational_stiffness: 150
+    rotational_damping: 7
+    translational_Ki: 0
+    translational_clip_x: 0.003
+    translational_clip_y: 0.003
+    translational_clip_z: 0.01
+    translational_clip_neg_x: 0.003
+    translational_clip_neg_y: 0.003
+    translational_clip_neg_z: 0.01
+    rotational_clip_x: 0.02
+    rotational_clip_y: 0.02
+    rotational_clip_z: 0.02
+    rotational_clip_neg_x: 0.02
+    rotational_clip_neg_y: 0.02
+    rotational_clip_neg_z: 0.02
+    rotational_Ki: 0
+  precision_param:
+    translational_stiffness: 3000
+    translational_damping: 89
+    rotational_stiffness: 300
+    rotational_damping: 9
+    translational_Ki: 0.1
+    translational_clip_x: 0.01
+    translational_clip_y: 0.01
+    translational_clip_z: 0.01
+    translational_clip_neg_x: 0.01
+    translational_clip_neg_y: 0.01
+    translational_clip_neg_z: 0.01
+    rotational_clip_x: 0.05
+    rotational_clip_y: 0.05
+    rotational_clip_z: 0.05
+    rotational_clip_neg_x: 0.05
+    rotational_clip_neg_y: 0.05
+    rotational_clip_neg_z: 0.05
+    rotational_Ki: 0.1
