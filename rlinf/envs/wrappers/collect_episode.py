@@ -74,6 +74,9 @@ class CollectEpisode(gym.Wrapper):
         only_success: bool = False,
         finalize_interval: int = 100,
         record_svo: bool = False,
+        repo_id: Optional[str] = None,
+        root: Optional[str] = None,
+        svo_dir: Optional[str] = None,
     ):
         if isinstance(env, gym.Env):
             super().__init__(env)
@@ -87,6 +90,8 @@ class CollectEpisode(gym.Wrapper):
             )
 
         self.save_dir = save_dir
+        self.repo_id = repo_id
+        self.root = root
         self.rank = rank
         self.num_envs = num_envs
         self.show_goal_site = show_goal_site
@@ -97,7 +102,15 @@ class CollectEpisode(gym.Wrapper):
         self.finalize_interval = finalize_interval
 
         self.record_svo = record_svo
-        self._svo_dir = os.path.join(os.path.dirname(save_dir.rstrip("/")), "svo")
+        # SVO archive tied to the dataset root (parallel dir, same prefix), so it
+        # accumulates across sessions alongside the parquet. Falls back to the
+        # legacy sibling-of-save_dir when no fixed dataset root is configured.
+        if svo_dir is not None:
+            self._svo_dir = svo_dir
+        elif root is not None:
+            self._svo_dir = f"{root.rstrip('/')}_svo"
+        else:
+            self._svo_dir = os.path.join(os.path.dirname(save_dir.rstrip("/")), "svo")
         self._svo_active: dict[str, str] = {}
         self._svo_kept = 0
 
@@ -559,10 +572,12 @@ class CollectEpisode(gym.Wrapper):
             first = ep_data[0]
             wrist_image_keys = self._collect_image_keys(first, "wrist_image")
             extra_view_image_keys = self._collect_image_keys(first, "extra_view_image")
-            self._lerobot_writer.create(
-                repo_id=os.path.join(
-                    self.save_dir, f"rank_{self.rank}", f"id_{self._episodes_written}"
-                ),
+            repo_id = self.repo_id or os.path.join(
+                self.save_dir, f"rank_{self.rank}", f"id_{self._episodes_written}"
+            )
+            self._lerobot_writer.open_or_create(
+                repo_id=repo_id,
+                root=self.root,
                 robot_type=self.robot_type,
                 fps=self.fps,
                 image_shape=first["image"].shape if "image" in first else None,
