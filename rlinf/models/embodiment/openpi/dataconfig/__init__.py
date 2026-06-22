@@ -32,6 +32,9 @@ from rlinf.models.embodiment.openpi.dataconfig.behavior_dataconfig import (
 from rlinf.models.embodiment.openpi.dataconfig.calvin_dataconfig import (
     LeRobotCalvinDataConfig,
 )
+from rlinf.models.embodiment.openpi.dataconfig.droid_dataconfig import (
+    LeRobotDROIDDataConfig,
+)
 from rlinf.models.embodiment.openpi.dataconfig.franka_co_training_dataconfig import (
     LeRobotFrankaEEDataConfig,
 )
@@ -426,6 +429,19 @@ _CONFIGS = [
             assets=AssetsConfig(asset_id="assets/droid"),
         ),
         pytorch_weight_path="checkpoints/torch/pi05_droid_polaris",
+    ),
+    TrainConfig(
+        name="pi05_droid",
+        model=pi0_config.Pi0Config(action_horizon=15, pi05=True),
+        data=LeRobotDROIDDataConfig(
+            repo_id="lerobot/droid",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(assets_dir="checkpoints/torch/pi05_droid/assets"),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "checkpoints/jax/pi05_droid/params"
+        ),
+        pytorch_weight_path="checkpoints/torch/pi05_droid",
     ),
 ]
 

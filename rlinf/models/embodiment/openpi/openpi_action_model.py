@@ -506,6 +506,30 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             processed_obs["observation/state_ee_pos"] = state[:, :3]
             processed_obs["observation/state_ee_rot"] = state[:, 3:6]
             processed_obs["observation/state_gripper"] = state[:, 6:7]
+        elif "pi05_droid" in self.config.config_name:
+            # DROID schema. We emit the *exact* keys DroidInputs reads
+            # (`exterior_image_1_left`, `wrist_image_left`, `joint_position`,
+            # `gripper_position`) because openpi/__init__.py:104 drops
+            # `data_config.repack_transforms` on the floor — RepackTransform
+            # would never run.
+            #
+            # Remove the `observation/image` key the base code set above; the
+            # exterior frame moves to `exterior_image_1_left`.
+            processed_obs.pop("observation/image", None)
+            processed_obs["observation/exterior_image_1_left"] = env_obs["main_images"]
+
+            # State split. RealWorldEnv._wrap_obs concats the env state dict
+            # by sorted key, so order is gripper_position (1) | joint_position (7).
+            state = env_obs["states"]
+            processed_obs["observation/gripper_position"] = state[:, 0:1]
+            processed_obs["observation/joint_position"] = state[:, 1:8]
+
+            # FrankaJointVelEnv puts the wrist cam in extra_view_images
+            # (main_image_key is the exterior cam). DROID's input slot is
+            # `wrist_image_left`, so pull the first extra view here.
+            extra = env_obs.get("extra_view_images", None)
+            if extra is not None:
+                processed_obs["observation/wrist_image_left"] = extra[:, 0]
         else:
             processed_obs["observation/state"] = env_obs["states"]
         if env_obs["wrist_images"] is not None:
