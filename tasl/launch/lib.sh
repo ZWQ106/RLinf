@@ -13,7 +13,11 @@ set -euo pipefail
 : "${LAUNCH_DRY_RUN:=}"
 ZED_EXTERIOR=36443134
 ZED_WRIST=17150101
-ZERORPC_ADDR="tcp://100.75.6.62:4242"
+# NUC1 over the ROBOT network (Desktop is on 172.16.0.x). Tailscale
+# (100.75.6.62) is the legacy path. Override either with an env var.
+NUC1_HOST="${NUC1_HOST:-172.16.0.2}"
+NUC1_SSH="${NUC1_SSH:-tasl@$NUC1_HOST}"
+ZERORPC_ADDR="tcp://$NUC1_HOST:4242"
 DESKTOP_HOME=/home/franka_desktop
 REPO="$DESKTOP_HOME/RLinf"          # consolidated fork checkout (tasl-lab/RLinf)
 TASL="$REPO/tasl"                   # bench operator tooling lives here
@@ -112,8 +116,9 @@ preflight_robot() {
   local me="$1"
   step "Robot: zerorpc get_robot_state @ $ZERORPC_ADDR"
   robot_ok || die "robot controller unreachable at $ZERORPC_ADDR.
-    Bring up the controller on NUC1 first:
-      ssh tasl@100.75.6.62            (sudo password: tasl123456)
+    Bring up the controller on NUC1 first (or just run teleop.sh, which does
+    this for you):
+      ssh $NUC1_SSH            (sudo password: tasl123456)
       sudo systemctl stop franka-robot-server
       cd ~/polymetis_fr3 && docker compose up -d
     Then make sure the FR3 is powered and FCI is active in Desk (brakes off,

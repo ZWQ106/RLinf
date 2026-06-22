@@ -110,7 +110,10 @@ GATE_FILE = "/tmp/collect_gate"
 CONTAINER_RAY = "/opt/venv/openpi/bin/ray"
 
 # DROID polymetis container on NUC1 (zerorpc, FCI on C2 port).
-DROID_ADDR = "tcp://100.75.6.62:4242"
+# Reached over the ROBOT network (172.16.0.2) by default — the Desktop is on
+# 172.16.0.x; Tailscale (100.75.6.62) is the legacy path. Override: NUC1_HOST=…
+NUC1_HOST = os.environ.get("NUC1_HOST", "172.16.0.2")
+DROID_ADDR = f"tcp://{NUC1_HOST}:4242"
 # DROID reset/home pose (radians), same as the RLinf env uses.
 DROID_HOME_Q = [0.0, -0.6283, 0.0, -2.5133, 0.0, 1.8850, 0.0]
 
@@ -676,6 +679,9 @@ class CollectionManager:
                 f"{CONTAINER_PY} examples/embodiment/collect_real_data.py "
                 "--config-name realworld_collect_data_polymetis_jointvel "
                 "env.eval.gello_port=/dev/gello "
+                # Reach the controller over the robot net, not the config's
+                # legacy Tailscale robot_ip (overrides node_groups[0] hardware).
+                f"cluster.node_groups.0.hardware.configs.0.robot_ip={NUC1_HOST} "
                 f"runner.num_data_episodes={int(num_episodes)} "
                 f"runner.logger.log_path={log_path} "
                 f"{override} "
