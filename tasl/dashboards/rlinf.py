@@ -364,21 +364,9 @@ class EvalRunner:
         with self._lock:
             if self.proc is None or self.proc.poll() is not None:
                 return "not running"
-            # 1. Halt ruckig motion on NUC1 FIRST — chunk_step_native is
-            # blocked in a 0.5s HTTP call; killing python alone leaves the
-            # motion running to completion. /move/joint_velocity_stop +
-            # /stop drop the current motion preempt-safe within ~50ms.
-            try:
-                requests.post(
-                    f"{self.rs_url}/move/joint_velocity_stop",
-                    timeout=2.0,
-                )
-            except Exception as exc:
-                _log.warning(f"jvel_stop post failed: {exc}")
-            try:
-                requests.post(f"{self.rs_url}/stop", timeout=2.0)
-            except Exception as exc:
-                _log.warning(f"/stop post failed: {exc}")
+            # 1. Kill the eval FIRST (stops its zerorpc velocity stream), then
+            # settle the arm to zero velocity below. Order matters: halting while
+            # the eval still streams would race two clients on the controller.
 
             # 2. Kill python in container (covers all Ray workers too).
             if HOST_MODE:
@@ -401,6 +389,16 @@ class EvalRunner:
                     os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
             except ProcessLookupError:
                 pass
+            # 4. Settle: stream a few zero-velocity ticks so the arm doesn't
+            # coast on the last commanded velocity (impedance holds last setpoint).
+            try:
+                c = DroidClient(timeout=5)
+                try:
+                    c.halt()
+                finally:
+                    c.close()
+            except Exception as exc:
+                _log.warning(f"post-stop halt failed: {exc}")
             return "stopped"
 
     def status(self) -> dict:
@@ -507,75 +505,199 @@ def latest_action_stats() -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# robot_server helpers
+# robot control — zerorpc to the DROID polymetis container (backend B)
 # ─────────────────────────────────────────────────────────────────────
+# NUC1 polymetis DROID container (zerorpc :4242). Robot net by default; the
+# launcher exports NUC1_HOST so the dashboard and the eval env agree on the host.
+NUC1_HOST = os.environ.get("NUC1_HOST", "172.16.0.2")
+DROID_ADDR = f"tcp://{NUC1_HOST}:4242"
+# DROID home (the env's joint_reset_qpos default). go_home streams to this.
+DROID_HOME_Q = [0.0, -0.6283, 0.0, -2.5133, 0.0, 1.8850, 0.0]
+
+
+class DroidClient:
+    """Per-request zerorpc client to the DROID polymetis container (backend B).
+
+    Faithful port of collect.py's robot-panel client. Created FRESH inside each
+    Flask handler and closed in a finally: zerorpc rides on gevent whose hub is
+    thread-local, and Flask threaded=True serves each request on an arbitrary
+    thread — a client made on thread A dies with an opaque LoopExit when used
+    from thread B. Per-request connect is cheap ZMQ setup, and the panel runs at
+    button-press frequency. Load-bearing semantics preserved from the vendored
+    client: POSITIONAL args only (kwargs are silently dropped → wrong action
+    space); get_robot_state() returns a [state, ts] 2-list; joint moves are
+    STREAMED (DROID adaptive_time_to_go() returns 0 for small deltas, so a
+    blocking one-shot is a silent no-op).
+    """
+
+    def __init__(self, address: str = DROID_ADDR, timeout: int = 5):
+        import zerorpc as _zerorpc
+        self._c = _zerorpc.Client(heartbeat=20, timeout=timeout)
+        self._c.connect(address)
+
+    def close(self) -> None:
+        try:
+            self._c.close()
+        except Exception:
+            pass
+
+    def get_robot_state(self) -> dict:
+        state, _ts = self._c.get_robot_state()  # [state, ts] 2-list
+        return {
+            "joint_positions": [float(x) for x in state["joint_positions"]],
+            "gripper_position": float(state["gripper_position"]),
+        }
+
+    def move_to_joint_target(self, target_q7, gripper_cmd: Optional[float] = None,
+                             max_step: float = 0.06, hz: int = 15,
+                             timeout_s: float = 25.0, tol: float = 0.03) -> float:
+        """Closed-loop leashed approach to an absolute joint target (returns max
+        joint error rad). Each tick reads the ACTUAL pose and commands a setpoint
+        at most max_step rad ahead — speed-bounded, no reflex/lunge. Holds the
+        current gripper unless gripper_cmd given."""
+        if gripper_cmd is None:
+            gripper_cmd = self.get_robot_state()["gripper_position"]
+        target = [float(x) for x in target_q7]
+        deadline = time.monotonic() + timeout_s
+        maxerr = float("inf")
+        while True:
+            cur = self.get_robot_state()["joint_positions"]
+            err = [t - c for t, c in zip(target, cur)]
+            maxerr = max(abs(e) for e in err)
+            if maxerr < tol or time.monotonic() > deadline:
+                return maxerr
+            setpoint = [c + max(-max_step, min(max_step, e))
+                        for c, e in zip(cur, err)]
+            self._c.update_command(setpoint + [float(gripper_cmd)],
+                                   "joint_position", "position", False)
+            time.sleep(1.0 / hz)
+
+    def halt(self, ticks: int = 8, hz: int = 15) -> None:
+        """Stream a few zero joint-velocity ticks to settle the arm (used after
+        killing the eval, which stops its own stream)."""
+        grip = self.get_robot_state()["gripper_position"]
+        zero = [0.0] * 7 + [float(grip)]
+        for _ in range(ticks):
+            self._c.update_command(zero, "joint_velocity", "position", False)
+            time.sleep(1.0 / hz)
+
+    def update_gripper(self, command: float) -> None:
+        cmd = min(max(float(command), 0.0), 1.0)
+        self._c.update_gripper(cmd, False, False)  # POSITIONAL: command, velocity, blocking
+
+    def kill_controller(self) -> None:
+        self._c.kill_controller()
+
+    def bootstrap(self, settle_seconds: float = 8.0) -> None:
+        self._c.launch_controller()
+        time.sleep(settle_seconds)
+        self._c.launch_robot()
+
+
 class RS:
-    def __init__(self, url: str):
-        self.url = url.rstrip("/")
+    """Robot control facade over the polymetis zerorpc controller. Keeps the
+    method names the Flask routes already call, but each method opens a fresh
+    gevent-safe DroidClient (see above) instead of HTTP to a franky robot_server.
+    Returns dicts with `_err` on failure so the existing handlers are unchanged.
+    """
 
-    def _get(self, ep: str, t: float = 2.0):
-        try:
-            r = requests.get(f"{self.url}{ep}", timeout=t)
-            return r.json() if r.ok else {"_err": r.status_code, "_body": r.text[:200]}
-        except requests.RequestException as e:
-            return {"_err": "exc", "_body": repr(e)[:200]}
-
-    def _post(self, ep: str, payload=None, t: float = 30.0):
-        try:
-            r = requests.post(f"{self.url}{ep}", json=payload or {}, timeout=t)
-            return r.json() if r.ok else {"_err": r.status_code, "_body": r.text[:200]}
-        except requests.RequestException as e:
-            return {"_err": "exc", "_body": repr(e)[:200]}
-
-    def ping(self):
-        return self._get("/ping")
+    def __init__(self, addr: str = DROID_ADDR):
+        # `addr` may be a tcp://host:port (preferred) or a stale http://host:port
+        # from an old default — coerce the latter to the zerorpc address.
+        if addr.startswith("http://"):
+            host = addr[len("http://"):].split(":")[0]
+            addr = f"tcp://{host}:4242"
+        self.addr = addr
 
     def state(self):
-        return self._get("/state")
+        c = DroidClient(self.addr, timeout=5)
+        try:
+            st = c.get_robot_state()
+            # `q` kept for /set_home compatibility (was franka_server's key).
+            st["q"] = st["joint_positions"]
+            return st
+        except Exception as e:
+            return {"_err": "exc", "_body": repr(e)[:200]}
+        finally:
+            c.close()
 
     def robotiq_state(self):
-        return self._get("/robotiq/state")
+        c = DroidClient(self.addr, timeout=5)
+        try:
+            return {"gripper_position": c.get_robot_state()["gripper_position"]}
+        except Exception as e:
+            return {"_err": "exc", "_body": repr(e)[:200]}
+        finally:
+            c.close()
 
     def go_home(self, target_q, dynamics_factor: float = 0.05):
-        return self._post(
-            "/move/joint",
-            {"target_q": list(target_q), "dynamics_factor": dynamics_factor},
-            t=30.0,
-        )
+        c = DroidClient(self.addr, timeout=30)
+        try:
+            err = c.move_to_joint_target(list(target_q))
+            ok = err < 0.03
+            return {"ok": ok, "max_joint_error_rad": round(err, 4),
+                    "msg": (f"home done, max joint error {err:.4f} rad" if ok else
+                            f"home NOT converged ({err:.4f} rad) — Desk/E-stop? then Recover.")}
+        except Exception as e:
+            return {"_err": "exc", "_body": repr(e)[:200]}
+        finally:
+            c.close()
 
     def stop(self):
-        return self._post("/stop", {}, t=3.0)
+        c = DroidClient(self.addr, timeout=10)
+        try:
+            c.halt()
+            return {"ok": True, "msg": "halted (zero velocity)"}
+        except Exception as e:
+            return {"_err": "exc", "_body": repr(e)[:200]}
+        finally:
+            c.close()
 
     def recover(self):
-        return self._post("/recover", {}, t=3.0)
-
-    def jog_cartesian(self, dx: float, dy: float, dz: float,
-                      drx: float = 0.0, dry: float = 0.0, drz: float = 0.0,
-                      dynamics_factor: float = 0.05):
-        """One-shot cartesian jog. Euler (xyz, radians) → quaternion delta."""
-        # Small-angle Euler → quaternion (intrinsic xyz / rzryrx order matches
-        # what FrankaEnv uses elsewhere).
-        cx, sx = np.cos(drx / 2), np.sin(drx / 2)
-        cy, sy = np.cos(dry / 2), np.sin(dry / 2)
-        cz, sz = np.cos(drz / 2), np.sin(drz / 2)
-        qx = sx * cy * cz - cx * sy * sz
-        qy = cx * sy * cz + sx * cy * sz
-        qz = cx * cy * sz - sx * sy * cz
-        qw = cx * cy * cz + sx * sy * sz
-        payload = {
-            "delta_translation": [float(dx), float(dy), float(dz)],
-            "delta_quaternion": [float(qx), float(qy), float(qz), float(qw)],
-            "dynamics_factor": float(dynamics_factor),
-        }
-        return self._post("/move/cartesian_relative", payload, t=10.0)
+        # Synchronous; 90s timeout — a COLD launch_controller (container just up
+        # + FCI just activated) can exceed 30s and finish server-side after the
+        # client gives up, so on a bootstrap RPC error re-check state and treat a
+        # live controller as success (no false 500). Mirrors collect.py.
+        c = DroidClient(self.addr, timeout=90)
+        try:
+            try:
+                c.kill_controller()
+            except Exception as e:
+                _log.warning(f"kill_controller during recover: {e}")
+            try:
+                c.bootstrap()
+            except Exception as e:
+                _log.warning(f"bootstrap RPC error during recover: {e!r}; re-checking state")
+                rc = DroidClient(self.addr, timeout=8)
+                try:
+                    rc.get_robot_state()
+                except Exception:
+                    return {"_err": "exc", "_body": repr(e)[:200]}
+                finally:
+                    rc.close()
+                return {"ok": True, "msg": "recover done (controller live; bootstrap RPC was slow)"}
+            return {"ok": True, "msg": "recover done (controller relaunched)"}
+        finally:
+            c.close()
 
     def gripper(self, action: str, speed: float = 0.3):
-        ep = "/robotiq/open" if action == "open" else "/robotiq/close"
-        return self._post(ep, {"speed": speed}, t=5.0)
+        c = DroidClient(self.addr, timeout=10)
+        try:
+            c.update_gripper(0.0 if action == "open" else 1.0)
+            return {"ok": True, "msg": f"gripper {action} sent"}
+        except Exception as e:
+            return {"_err": "exc", "_body": repr(e)[:200]}
+        finally:
+            c.close()
+
+    def jog_cartesian(self, *args, **kwargs):
+        # Not supported on the polymetis backend (no relative-cartesian RPC here).
+        return {"_err": "unsupported",
+                "_body": "cartesian jog not available on the polymetis backend"}
 
     def freedrive(self, enable: bool):
-        ep = "/freedrive/on" if enable else "/freedrive/off"
-        return self._post(ep, {}, t=3.0)
+        return {"_err": "unsupported",
+                "_body": "freedrive not available on the polymetis backend"}
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -927,7 +1049,9 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--port", type=int, default=8003)
     p.add_argument("--bind", default="0.0.0.0")
-    p.add_argument("--robot-server", default="http://100.75.6.62:4242")
+    p.add_argument("--robot-server", default=DROID_ADDR,
+                   help="zerorpc address of the DROID polymetis controller "
+                        "(tcp://host:4242). Defaults to NUC1_HOST on the robot net.")
     p.add_argument("--resolution", default="HD720",
                    choices=["HD2K", "HD1080", "HD720"])
     p.add_argument("--jpeg-quality", type=int, default=70)
