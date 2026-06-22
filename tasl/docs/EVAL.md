@@ -1,65 +1,65 @@
-# TASL FR3 — pi05_droid Policy Eval Manual (RLinf runtime)
+# TASL FR3 — pi05_droid Policy Eval Manual (RLinf runtime, polymetis controller)
 
 How to run a **pi05_droid policy eval** on the FR3 bench through the **RLinf
-runtime** (`eval_embodied_agent.py`), end to end. For GELLO teleop/collection see
-[TELEOP.md](TELEOP.md); for the component map see [ARCHITECTURE.md](ARCHITECTURE.md).
+runtime** (`eval_embodied_agent.py`), driving the arm with the **same polymetis
+controller as teleop/collect**. We use RLinf only for its efficient pi05_droid
+inference + infra; the robot is driven by the proven polymetis joint-velocity
+streaming path. For GELLO teleop/collection see [TELEOP.md](TELEOP.md); for the
+component map see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ---
 
-## 0. The two pi05 deployment paths (and why this one is different)
+## 0. The two pi05 deployment paths (and what they share)
 
-The same pi05_droid VLA can drive the arm through **two different runtimes**, and
-they even use **different NUC controllers**:
+The same pi05_droid VLA can drive the arm through **two runtimes**, but — per the
+design decision on 2026-06-22 — **both use the polymetis zerorpc controller**
+(backend B). The franky `robot_server` (backend A) is *not* used; it was too
+limited in practice.
 
 | | **openpi standalone** (`openpi.py` :8003) | **RLinf eval** (`rlinf.py` :8003) — *this doc* |
 |---|---|---|
 | Policy | openpi `serve_policy` WS :8000 + in-process loop | model loaded inside RLinf, under **Ray** |
 | Runtime | thin client on the Desktop host | `eval_embodied_agent.py` in `rlinf-eval` container |
 | Checkpoint | openpi-format `~/.cache/openpi/.../pi05_droid` | RLinf-format `/ckpts/pi05_droid_pt` |
-| Rollout owner | the dashboard loop | the RLinf **`FrankaJointVelEnv`** |
-| **NUC controller** | DroidLikeClient **zerorpc** (backend B) | franky **`robot_server` HTTP** (backend A) |
+| Rollout owner | the dashboard loop | the RLinf env (`FrankaJointVelEnv` + `RealWorldEnv.chunk_step`) |
+| **NUC controller** | polymetis **zerorpc** (backend B) | polymetis **zerorpc** (backend B) ✅ same |
 | Data written | none (pure inference) | LeRobot dataset (`/tmp/rlinf_pi05_droid_eval`) |
-| Use it to… | quickly sanity-check the checkpoint | eval the policy in the exact env training/RL use |
+| Use it to… | quickly sanity-check the checkpoint | eval the policy in the RLinf env at scale |
 
-**Key consequence:** RLinf eval is the *mirror-opposite* of teleop/collect.
-Teleop drives backend **B** (polymetis zerorpc); eval drives backend **A** (franky
-`robot_server` HTTP). Both bind NUC1 `:4242` and are mutually exclusive, so
-`eval.sh` brings backend A up and takes backend B down. `teleop.sh` does the reverse.
+**Why polymetis works for chunked VLA execution:** RLinf's pi05 rollout emits an
+action *chunk* (e.g. 8 waypoints). `RealWorldEnv.chunk_step` executes it by
+streaming the waypoints action-by-action over the polymetis `update_joint_velocity`
+(non-blocking, ~15 Hz) — the exact path GELLO teleop already streams smoothly. So
+we do **not** need franky's blocking HTTP `/move/joint_velocity_chunk`. Same
+controller, same `:4242`, same FCI bring-up as teleop.
 
 ---
 
-## 1. One-time prerequisite — mount the eval checkout
+## 1. One-time prerequisite — unified eval checkout (pi05 inference on the polymetis branch)
 
-The RLinf eval needs code + config that live **only on the eval branch**
-(`franka-fr3/rlinf-pi05-droid-eval`): `realworld_eval_pi05_droid.yaml`,
-`env/realworld_franka_jointvel.yaml`, `rlinf/envs/realworld/realworld_chunk_env.py`
-(the `realworld_chunk_native` wrapper), and the openpi `droid_dataconfig.py` that
-registers the `pi05_droid` TrainConfig. The default mounted checkout
-(`~/work/rlinf-clone`, on the **polymetis collect** branch) does **not** have these
-— and that branch *deletes* `polymetis_controller.py`, so one checkout can't serve
-both teleop and eval.
+The eval reuses the **polymetis-controller** branch (which already drives the arm
+for collect) and adds **only the pi05_droid inference** on top. The mounted
+checkout `~/work/rlinf-clone` (branch `tasl-bench-polymetis-controller`) already
+has the controller (`polymetis_controller.py`, `droid_zerorpc_client.py`, the
+polymetis `FrankaJointVelEnv`, `RealWorldEnv.chunk_step`) and the openpi action
+model. What it still **needs** (the integration work, see §7):
 
-A full eval-branch checkout already exists at **`~/work/rlinf-clone-rtc-old`**
-(branch `franka-fr3/rtc-pi05-droid-deploy`). Point the `rlinf-eval` container's
-`/workspace/rlinf` at the eval checkout before running eval. Either:
+- `rlinf/models/embodiment/openpi/dataconfig/droid_dataconfig.py` — register the
+  **`pi05_droid`** TrainConfig (mirror the existing `pi05_droid_polaris`, point
+  `pytorch_weight_path` at `/ckpts/pi05_droid_pt`, set our DROID cam/action map).
+- `examples/embodiment/config/realworld_eval_pi05_droid_polymetis.yaml` — the eval
+  config: `model/pi0_5` + openpi `pi05_droid` + `env/realworld_franka_jointvel_polymetis`
+  (polymetis controller) + `only_eval: True` + chunk via `RealWorldEnv.chunk_step`,
+  with `robot_ip: 172.16.0.2` (robot net) and our camera serials.
+- `rlinf.py` dashboard: robot panel swapped from HTTP `RS` → zerorpc `DroidClient`
+  (port the proven plumbing from `collect.py`); eval spawn → the polymetis config.
 
-- **Recreate the container** with the eval checkout mounted:
-  `… -v ~/work/rlinf-clone-rtc-old:/workspace/rlinf …`, **or**
-- **Check out the eval branch** inside `~/work/rlinf-clone`
-  (`git checkout franka-fr3/rlinf-pi05-droid-eval`) — but that takes teleop/collect
-  offline until you switch back.
+`eval.sh` **preflights** the config + `polymetis_controller.py` + `droid_dataconfig.py`
+and refuses to launch (with the missing-file list) if `/workspace/rlinf` lacks them.
 
-`eval.sh` **preflights this** and refuses to launch (with the missing-file list) if
-`/workspace/rlinf` doesn't have the eval code — so a wrong mount fails loudly, not
-mid-rollout.
-
-Also fix the controller IP in the staged config: set
-`env.{train,eval}.override_cfg.robot_server_url: http://172.16.0.2:4242` (the branch
-ships the stale Tailscale `100.75.6.62`). `eval.sh` passes `--robot-server` to the
-dashboard, but the env reads `robot_server_url` from the YAML, so both must point at
-the robot net.
-
-The checkpoint `/ckpts/pi05_droid_pt` is already mounted (verified present).
+The checkpoint `/ckpts/pi05_droid_pt` is already mounted (verified present). Because
+this is all on the polymetis branch, **one checkout/container serves both collect
+and eval** — no backend A/B split.
 
 ---
 
@@ -69,38 +69,36 @@ The checkpoint `/ckpts/pi05_droid_pt` is already mounted (verified present).
 sudo ~/RLinf/tasl/launch/eval.sh
 ```
 
-Four stages (mirror of teleop.sh, opposite backend):
+Four stages (Stages 1–2 are identical to `teleop.sh` — same polymetis backend):
 
-1. **NUC1 backend (A)** — ssh `tasl@172.16.0.2`: `docker compose down` the
-   polymetis container (release `:4242`), then `systemctl start franka-robot-server`
-   (the unit we keep *disabled at boot*). Waits until `:4242/state` answers HTTP.
-   *⚠ The franky `robot_server` was set up but never verified end-to-end — if Stage 1
-   times out, debug it on NUC1 (`journalctl -u franka-robot-server`).*
+1. **NUC1 backend (B)** — ssh `tasl@172.16.0.2`: stop `franka-robot-server` (FCI
+   exclusivity), `docker compose up -d` the polymetis container, wait for zerorpc
+   `:4242`.
 2. **FCI gate (manual)** — open **Franka Desk** `https://172.16.0.1`, unlock joints,
    **Activate FCI** + execution mode, then press Enter.
 3. **Eval dashboard `:8003`** — frees the ZEDs, launches `rlinf.py --mode host`.
    The dashboard **owns the cameras permanently** and serves frames over HTTP
    (`/cam/<name>.jpg`) to the in-container env — no camera handoff.
-4. **Recover + auto-home** — recovers the franky controller and homes to the DROID
-   anchor pose via the dashboard (proxied to `robot_server`).
+4. **Bootstrap + auto-home** — bootstraps the polymetis controller against the live
+   FCI (zerorpc) and homes to the DROID anchor pose, via the dashboard.
 
 ---
 
 ## 3. Run eval episodes
 
 1. Open `http://<printed IP>:8003` (or `http://localhost:8003` on the Desktop).
-   Confirm live ZED previews + the **policy view** tiles (224×224 center-crop — the
-   exact frames the model sees) + green robot status.
+   Confirm live ZED previews + the **policy view** tiles (224×224 center-crop) +
+   green robot status.
 2. **Type the task prompt** (e.g. "pick up the cup") and press **Start**.
    The dashboard `docker exec`s `eval_embodied_agent.py --config-name
-   realworld_eval_pi05_droid` with Hydra overrides for the prompt + home pose; the
-   `FrankaJointVelEnv` then runs one episode: read frames → policy → action chunk →
-   `robot_server /move/joint_velocity_chunk`.
+   realworld_eval_pi05_droid_polymetis` with Hydra overrides for the prompt + home
+   pose; the env runs one episode: read frames → policy → action chunk →
+   `RealWorldEnv.chunk_step` streams it over polymetis `update_joint_velocity`.
 3. **SAFETY — the first rollout is autonomous** (a neural net drives the arm). Hand
    on the E-stop, arm at home, watch the first few action chunks for sane direction
-   and magnitude before trusting it. `eval_rollout_epoch: 1` → one episode per Start.
-4. **Stop** ends the run (halts ruckig motion first, then kills the eval).
-   Data lands in `/tmp/rlinf_pi05_droid_eval` (LeRobot) inside the container.
+   and magnitude before trusting it.
+4. **Stop** ends the run. Data lands in `/tmp/rlinf_pi05_droid_eval` (LeRobot)
+   inside the container.
 
 **Gripper / action convention** matches collect: action `[7] ∈ [0,1]`, binary at
 `0.5`; `action_scale 0.3`, `joint_vel_max 0.4 rad/s`, `dynamics_factor 0.3`.
@@ -114,12 +112,12 @@ Four stages (mirror of teleop.sh, opposite backend):
   ```bash
   sudo ~/RLinf/tasl/launch/eval-stop.sh
   ```
-  Halts motion, stops the eval dashboard, reaps in-container eval/ray procs (frees
-  ZEDs), **stops `franka-robot-server`** on NUC1, and verifies `:4242` closed → FCI
-  released. Then re-lock the joints in Desk.
+  Stops the eval dashboard, reaps in-container eval/PolymetisController/ray procs
+  (frees ZEDs), brings the polymetis container **down**, verifies `:4242` closed →
+  FCI released. Then re-lock the joints in Desk.
 
-> To switch back to teleop/collect afterwards: just run `teleop.sh` — it stops the
-> franky server and brings the polymetis container back up.
+> To switch back to teleop/collect afterwards: just run `teleop.sh` — same
+> controller, so it's effectively the same bring-up with the collect dashboard.
 
 ---
 
@@ -127,11 +125,11 @@ Four stages (mirror of teleop.sh, opposite backend):
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| Stage 1: `robot_server never answered :4242/state` | franky `robot_server` not up / not working on NUC1 | `ssh tasl@172.16.0.2 'systemctl status franka-robot-server; journalctl -u franka-robot-server -n 50'`. This backend is unverified — may need fixing. |
-| `eval … MISSING eval code` preflight die | container mounts the polymetis checkout, not the eval branch | Point `/workspace/rlinf` at `~/work/rlinf-clone-rtc-old` (§1). |
-| Eval starts but env can't reach the robot | `robot_server_url` still Tailscale `100.75.6.62` | Set it to `http://172.16.0.2:4242` in the staged config. |
-| `:4242` open but it's zerorpc, not HTTP | polymetis container still up (backend B) | `eval.sh` brings it down; if it lingers: `ssh tasl@172.16.0.2 'cd ~/polymetis_fr3 && docker compose down'`. |
+| `eval … MISSING eval code` preflight die | container lacks the pi05 inference port / polymetis eval config | Complete §7 integration and mount the unified checkout. |
+| `recover` / state calls time out | polymetis controller wedged (FCI wasn't active at bootstrap) | `eval-stop.sh` → confirm FCI active + brakes off in Desk → `eval.sh` again. |
+| Jerky chunk execution | streaming rate / `action_scale` / `joint_vel_max` mismatch | tune `step_duration_s` (0.0667=15 Hz), `action_scale`, `joint_vel_max_rad_s` in the config. |
 | Policy view tiles black | cameras not acquired / wrong serials | check `36443134` (exterior) + `17150101` (wrist) enumerated; reseat USB. |
+| `:4242` open but eval can't bootstrap | franky robot_server somehow up (HTTP, not zerorpc) | `ssh tasl@172.16.0.2 'sudo systemctl stop franka-robot-server'`; `eval.sh` does this in Stage 1. |
 
 ---
 
@@ -139,10 +137,26 @@ Four stages (mirror of teleop.sh, opposite backend):
 
 - **Start / stop:** `sudo ~/RLinf/tasl/launch/eval.sh` · `sudo ~/RLinf/tasl/launch/eval-stop.sh`
 - **Dashboard:** `:8003` (rlinf.py, host mode) — *same port as the openpi dashboard; one at a time*
-- **Backend:** franky `robot_server` HTTP `http://172.16.0.2:4242` (backend **A**)
-- **Config:** `realworld_eval_pi05_droid` (env `realworld_franka_jointvel`, model `pi0_5`/openpi `pi05_droid`)
+- **Backend:** polymetis `droid-nuc-fr3` container, **zerorpc** `tcp://172.16.0.2:4242` (backend **B**, same as teleop)
+- **Config:** `realworld_eval_pi05_droid_polymetis` (env `realworld_franka_jointvel_polymetis`, model `pi0_5`/openpi `pi05_droid`)
 - **Checkpoint:** `/ckpts/pi05_droid_pt` (RLinf-format, already mounted)
-- **Eval checkout:** `~/work/rlinf-clone-rtc-old` (branch `franka-fr3/rtc-pi05-droid-deploy`)
 - **Data:** `/tmp/rlinf_pi05_droid_eval` (LeRobot) inside `rlinf-eval`
 - **Logs:** `~/RLinf/tasl/logs/eval.log` (dashboard) · `_dashboard_eval.log` in-container (eval)
 - **Home pose (rad):** `[0, -0.6283, 0, -2.5133, 0, 1.8850, 0]`
+
+---
+
+## 7. Integration status (what's left to wire)
+
+The launchers + this runbook are ready; the **pi05-inference-on-polymetis** code
+integration is the remaining work:
+
+- [ ] Port `droid_dataconfig.py` → register `pi05_droid` TrainConfig (mirror
+      `pi05_droid_polaris`; from `franka-fr3/rlinf-pi05-droid-eval` /
+      `work/rlinf-clone-rtc-old`), wire into `openpi_action_model.py`.
+- [ ] Write `realworld_eval_pi05_droid_polymetis.yaml` + (if absent)
+      `env/realworld_franka_jointvel_polymetis.yaml`, `robot_ip: 172.16.0.2`.
+- [ ] Swap `rlinf.py` robot panel HTTP `RS` → zerorpc `DroidClient` (port from
+      `collect.py`); point eval spawn at the polymetis config.
+- [ ] (optional) `rtc_guidance.py` for real-time chunking.
+- [ ] Validate on the bench: bootstrap → home → 1 episode, watch the first chunks.
