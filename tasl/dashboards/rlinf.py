@@ -257,7 +257,7 @@ class EvalRunner:
         self.home_store = home_store
         self.rs_url = rs_url.rstrip("/")
         self.proc: Optional[subprocess.Popen] = None
-        self.config_name = "realworld_eval_pi05_droid"
+        self.config_name = "realworld_eval_pi05_droid_polymetis"
         self.last_prompt = "grasp"
         self._lock = threading.Lock()
 

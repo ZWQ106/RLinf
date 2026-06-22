@@ -146,17 +146,40 @@ Four stages (Stages 1–2 are identical to `teleop.sh` — same polymetis backen
 
 ---
 
-## 7. Integration status (what's left to wire)
+## 7. Integration status
 
-The launchers + this runbook are ready; the **pi05-inference-on-polymetis** code
-integration is the remaining work:
+**✅ DONE — framework inference port (validated in `rlinf-eval`).** On branch
+`franka-fr3/eval-pi05-polymetis` in `~/work/rlinf-clone` (commit `feat(eval):
+pi05_droid inference over the polymetis controller`):
+- `droid_dataconfig.LeRobotDROIDDataConfig` + `pi05_droid` TrainConfig registered
+  (verified: `"pi05_droid" in _CONFIGS_DICT`).
+- `openpi_action_model.obs_processor` `pi05_droid` branch (emits DroidInputs keys).
+- `realworld_eval_pi05_droid_polymetis.yaml` — composes + resolves
+  (`controller_type: polymetis`, `robot_ip: 172.16.0.2`, `config_name: pi05_droid`,
+  `num_action_chunks: 8`, `use_gello: False`).
+- `rlinf.py` eval spawn → `config_name = realworld_eval_pi05_droid_polymetis`.
 
-- [ ] Port `droid_dataconfig.py` → register `pi05_droid` TrainConfig (mirror
-      `pi05_droid_polaris`; from `franka-fr3/rlinf-pi05-droid-eval` /
-      `work/rlinf-clone-rtc-old`), wire into `openpi_action_model.py`.
-- [ ] Write `realworld_eval_pi05_droid_polymetis.yaml` + (if absent)
-      `env/realworld_franka_jointvel_polymetis.yaml`, `robot_ip: 172.16.0.2`.
-- [ ] Swap `rlinf.py` robot panel HTTP `RS` → zerorpc `DroidClient` (port from
-      `collect.py`); point eval spawn at the polymetis config.
-- [ ] (optional) `rtc_guidance.py` for real-time chunking.
-- [ ] Validate on the bench: bootstrap → home → 1 episode, watch the first chunks.
+> The integration branch carries `~/work/rlinf-clone`'s pre-existing uncommitted
+> collect WIP untouched; only the 4 inference files were committed. To run eval,
+> the container must mount a checkout that has this branch's code (it currently
+> mounts `~/work/rlinf-clone`, so checking that branch out — or recreating
+> `rlinf-eval` against it — is the deploy step).
+
+**☐ TODO — dashboard robot panel zerorpc swap (best done + validated at the bench).**
+`rlinf.py` still drives its robot panel over HTTP `RS` (franky). The eval *run*
+doesn't need it (the in-container env bootstraps + homes on Start), but the panel
+buttons + `eval.sh` Stage 4 do. Port the proven per-request `DroidClient` from
+`collect.py` (gevent/zerorpc thread-affinity → fresh client per request, positional
+args only) and rewire:
+- `RS.state()` / status poll → `DroidClient().get_robot_state()`.
+- endpoints → `/api/robot/{state,home,recover,gripper/<a>}` (match `collect.py` +
+  `eval.sh`); update the dashboard JS that calls `/home` `/recover`.
+- `recover` → `DroidClient(timeout=90)` kill+bootstrap+state-recheck (copy
+  `collect.py:api_robot_recover`); `home` → leashed `move_to_joint_target`.
+- `EvalRunner.stop()` HTTP `/move/joint_velocity_stop` + `/stop` → kill the eval
+  proc (already does) + optional zerorpc zero-velocity; drop the HTTP calls.
+
+**☐ TODO — bench validation:** mount the eval branch → `eval.sh` → Start → watch
+the first chunks (E-stop in hand). Then `eval-stop.sh`.
+
+**☐ Optional later — `rtc_guidance.py`** for real-time chunking (deferred; baseline first).

@@ -127,19 +127,24 @@ desk "cd $TASL && ulimit -n 8192 && PYTHONPATH=$TASL:$SITE_PKGS NUC1_HOST=$NUC1_
 wait_http 8003 || die "eval dashboard did not answer on :8003 (see $TASL/logs/eval.log)"
 ok "dashboard up — http://$TS_IP:8003 (laptop, via Tailscale; robot-net IP if TS offline)"
 
-# ── Stage 4/4 — bootstrap controller + auto-home (zerorpc, via the dashboard) ─
-step "Stage 4/4 — bootstrap polymetis controller (recover) + auto-home"
-step "  recover: launch the controller against the now-live FCI (~10s, zerorpc)"
-desk "curl -fsS -X POST $DASH/api/robot/recover >/dev/null" \
-  || die "recover failed — controller could not bootstrap. Is FCI active + brakes off in Desk?"
-step "  home: leashed move to the DROID anchor pose"
+# ── Stage 4/4 — optional pre-eval bootstrap + home (zerorpc, via the dashboard) ─
+# NOTE: the in-container eval bootstraps the polymetis controller and resets
+# (homes) the arm itself on Start (PolymetisController.launch_controller +
+# env.reset). These dashboard calls are a pre-eval convenience and require the
+# rlinf.py robot panel to be on zerorpc (EVAL.md §7). Until that swap lands they
+# may 404/fail — that's NON-fatal: just press Start and the env will bootstrap.
+step "Stage 4/4 — (optional) pre-eval recover + home via dashboard zerorpc API"
 if [[ -z "$LAUNCH_DRY_RUN" ]]; then
-  resp=$(curl -fsS -X POST "$DASH/api/robot/home") || die "home request failed (dashboard :8003)"
-  echo "    $resp"
-  grep -q '"ok": *true' <<<"$resp" \
-    || warn "home did NOT converge — check Desk / E-stop, then press Recover in the UI before eval."
+  if curl -fsS -X POST "$DASH/api/robot/recover" >/dev/null 2>&1; then
+    ok "controller recovered"
+    resp=$(curl -fsS -X POST "$DASH/api/robot/home" 2>/dev/null || true)
+    [[ -n "$resp" ]] && echo "    $resp"
+  else
+    warn "dashboard robot API not available yet (needs the rlinf.py zerorpc swap, EVAL.md §7).
+       Skip — the in-container eval bootstraps + homes on Start anyway."
+  fi
 else
-  echo "DRY: curl -X POST $DASH/api/robot/home"
+  echo "DRY: curl -X POST $DASH/api/robot/recover ; curl -X POST $DASH/api/robot/home (best-effort)"
 fi
 
 ok "READY — open http://$TS_IP:8003, type a task prompt, press Start to run an eval episode.
