@@ -33,7 +33,7 @@ if [[ -z "$LAUNCH_DRY_RUN" ]]; then sleep 2; fi
 step "Launch collect dashboard :8004 (--no-cam-on-start)"
 desk "cd $TASL && ulimit -n 8192 && PYTHONPATH=$TASL:$SITE_PKGS setsid /usr/bin/python3 dashboards/collect.py --port 8004 --no-cam-on-start </dev/null >> $TASL/logs/collect.log 2>&1 &"
 wait_http 8004 || die "collect dashboard did not answer on :8004 (see $TASL/logs/collect.log)"
-ok "dashboard up on :8004"
+ok "dashboard up — http://$TS_IP:8004 (laptop, via Tailscale; robot-net IP if TS offline)"
 
 step "vkbd handoff: docker restart rlinf-eval so the in-container 's'/'c' listener binds the new uinput"
 desk "docker restart rlinf-eval"

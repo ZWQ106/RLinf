@@ -89,7 +89,7 @@ desk "cd $TASL && ulimit -n 8192 && PYTHONPATH=$TASL:$SITE_PKGS NUC1_HOST=$NUC1_
 wait_http 8004 || die "collect dashboard did not answer on :8004 (see $TASL/logs/collect.log)"
 step "  vkbd handoff: docker restart rlinf-eval (rebind uinput 'c'/'s' listener)"
 desk "docker restart rlinf-eval"
-ok "dashboard up on :8004"
+ok "dashboard up — http://$TS_IP:8004 (laptop, via Tailscale; robot-net IP if TS offline)"
 
 # ── Stage 4/4 — bootstrap controller + auto-home ────────────────────────────
 step "Stage 4/4 — bootstrap controller (recover) + auto-home"
