@@ -28,6 +28,7 @@ full argument set as ``FrankaController`` (including ``ros_pkg``,
 call.  ROS-specific / end-effector-type args are accepted and ignored; this
 backend always drives the Robotiq 2F-85 gripper via DROID's zerorpc server.
 """
+
 import time
 from typing import Optional
 
@@ -140,6 +141,32 @@ class PolymetisController(Worker):
         self._client.update_cartesian_position(pose6, gripper_cmd=self._last_grip)
         self.log_debug(f"Move arm to position: {position}")
 
+    def move_joint_velocity(self, action_8d: np.ndarray):
+        """Stream one tick of an 8-D joint-velocity action.
+
+        action[:7] = joint velocities in [-1, 1]; action[7] = gripper position
+        (0=open, 1=close). Matches pi05_droid's native action; sent via DROID's
+        action_space="joint_velocity". Non-blocking (15 Hz streaming path)."""
+        a = np.asarray(action_8d, dtype=np.float64).reshape(-1)
+        assert a.shape == (8,), f"expected 8-D joint-velocity action, got {a.shape}"
+        self._client.update_joint_velocity(a, blocking=False)
+        self.log_debug(f"Move joint velocity: {a}")
+
+    def step_joint_velocity(self, action_8d: np.ndarray) -> FrankaRobotState:
+        """Command an 8-D joint-velocity action AND return the resulting state
+        in ONE actor RPC.
+
+        Folding the command + state read into a single env<->controller round
+        trip (instead of separate move_joint_velocity + get_state calls, with the
+        teleop wrapper's own joint read now served from the env's cached state)
+        cuts per-step controller RPCs from 3 to 1. Fewer round trips means a
+        steadier command cadence — the DROID joint-velocity controller ramps the
+        arm down when a fresh command arrives late, which is felt as a stutter."""
+        a = np.asarray(action_8d, dtype=np.float64).reshape(-1)
+        assert a.shape == (8,), f"expected 8-D joint-velocity action, got {a.shape}"
+        self._client.update_joint_velocity(a, blocking=False)
+        return self.get_state()
+
     # ---- end-effector actions --------------------------------------------
 
     def command_end_effector(self, action: np.ndarray) -> bool:
@@ -166,26 +193,20 @@ class PolymetisController(Worker):
 
     # ---- joint reset -----------------------------------------------------
 
-    def reset_joint(self, reset_pos, timeout_s: float = 15.0):
-        """Stream joint targets until convergence (atol 1e-2 rad) or timeout.
+    def reset_joint(self, reset_pos, timeout_s: float = 25.0):
+        """Speed-bounded leashed move to the reset joint pose; when this
+        returns the arm is AT the target (within tol) or we warned loudly.
 
-        Re-streams in 1s chunks to keep re-asserting the setpoint while
-        waiting — mirrors serl's _wait_for_joint contract: when this
-        returns, the arm is AT the target (or we warned loudly).
+        Uses the closed-loop leash (setpoint kept just ahead of the measured
+        pose) so the inter-episode joint reset does NOT lunge at full speed
+        and trip the Franka velocity/accel reflex — the old stream_joint_
+        position (constant final target) did exactly that from a far pose.
         """
-        target = np.asarray(reset_pos, dtype=np.float64)
-        deadline = time.monotonic() + timeout_s
-        while True:
-            self._client.stream_joint_position(target, duration_s=1.0,
-                                               gripper_cmd=self._last_grip)
-            q = self._client.get_robot_state()["joint_positions"]
-            if np.allclose(target, q, atol=1e-2):
-                return
-            if time.monotonic() > deadline:
-                self.log_warning(
-                    f"reset_joint not converged after {timeout_s}s: q={q}"
-                )
-                return
+        err = self._client.leashed_move_to_joint(
+            reset_pos, gripper_cmd=self._last_grip, timeout_s=timeout_s
+        )
+        if err >= 0.03:
+            self.log_warning(f"reset_joint not converged: max err {err:.4f} rad")
 
     # ---- compliance / error handling ------------------------------------
 

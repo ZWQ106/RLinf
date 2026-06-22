@@ -1,0 +1,114 @@
+# Smoke-scale value SFT on the 2026-06-12 bench pilot dataset (4 episodes).
+# Purpose: validate our LeRobot v2.1 schema flows through RECAP stage 2 on
+# the 4090 — NOT a real training run.
+# Usage (inside rlinf-eval container):
+#   cd examples/recap/value && REPO_PATH=/workspace/rlinf EMBODIED_PATH=$PWD \
+#   /opt/venv/openpi/bin/python train_value.py --config-path config \
+#   --config-name bench_pilot_sft_value
+
+defaults:
+  - model/value@actor.model
+  - training_backend/fsdp@actor.fsdp_config
+  - _self_
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:REPO_PATH}/examples/sft/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor,env,rollout: all
+
+runner:
+  task_type: sft
+  logger:
+    log_path: "/workspace/rlinf/outputs/value_sft_pilot"
+    project_name: rlinf
+    experiment_name: "value_sft_pilot_smoke"
+    logger_backends: ["tensorboard"]
+
+  max_epochs: 2
+  max_steps: 30          # smoke: ~30 optimizer steps then stop
+  val_check_interval: -1 # no eval set at pilot scale
+  save_interval: 1000000 # don't checkpoint during smoke
+
+data:
+  tag: pilot             # matches compute_returns_pilot.yaml -> meta/returns_pilot.parquet
+
+  train_data_paths:
+    - dataset_path: "/opt/.cache/huggingface/lerobot/outputs/pilot/collected_data/rank_0/id_0"
+      type: "rollout"    # episodes carry real is_success (3 fail / 1 success)
+      weight: 1.0
+      robot_type: "franka"   # single-cam key mapping: image/state/actions
+      model_type: "pi05"
+
+  eval_data_paths: []
+
+  train_num_workers: 4
+  eval_num_workers: 0
+  prefetch_factor: 2
+  persistent_workers: false
+  pin_memory: false
+  include_state: true
+  gamma: 1.0
+  action_horizon: 10
+  normalize_to_minus_one_zero: true
+  include_next_obs: false
+  action_dim: 32         # openpi pad target (state[19]/actions[7] padded up)
+  robot_type: "franka"
+  model_type: "pi05"
+  balance_weights: true
+  seed: 42
+
+algorithm:
+  adv_type: gae
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 2    # 4090 24GB smoke
+  global_batch_size: 8
+  seed: 0
+  model:
+    precision: bf16
+    siglip_path: /workspace/rlinf/outputs/models/siglip2
+    gemma3_path: /workspace/rlinf/outputs/models/gemma3
+    tokenizer_path: /workspace/rlinf/outputs/models/gemma3
+    freeze_vlm: false
+    # state[19] and actions[7] both pad UP to 32 (openpi convention);
+    # the reference's 7 would truncate our 19-D serl state.
+    action_dim: 32
+    action_horizon: 10
+
+  optim:
+    lr: 5.0e-5
+    value_lr: 1.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-8
+    weight_decay: 1e-10
+    clip_grad: 1.0
+    lr_scheduler: "constant"
+    lr_warmup_steps: 5
+    total_training_steps: 30
+
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "no_shard"
+    use_orig_params: False
+    gradient_checkpointing: False
+    mixed_precision:
+      param_dtype: ${actor.model.precision}
+      reduce_dtype: ${actor.model.precision}
+      buffer_dtype: ${actor.model.precision}
+
+reward:
+  use_reward_model: False
+
+critic:
+  use_critic_model: False

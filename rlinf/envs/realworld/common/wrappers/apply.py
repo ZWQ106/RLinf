@@ -132,6 +132,34 @@ def apply_single_arm_wrappers(env: gym.Env, cfg: Mapping[str, Any]) -> gym.Env:
     return env
 
 
+def apply_single_arm_jointvel_wrappers(env: gym.Env, cfg: Mapping[str, Any]) -> gym.Env:
+    """Wrapper stack for the joint-velocity Franka env.
+
+    Joint-space teleop only: GelloJointIntervention + keyboard reward. The
+    cartesian wrappers (GripperCloseEnv, Spacemouse/Gello cartesian intervention,
+    RelativeFrame, Quat2Euler) are intentionally omitted — they assume an
+    EE-delta action / cartesian obs."""
+    from rlinf.envs.realworld.common.wrappers.gello_joint_intervention import (
+        GelloJointIntervention,
+    )
+
+    if not env.config.is_dummy and cfg.get("use_gello", True):
+        gello_port = cfg.get("gello_port", None)
+        if gello_port is None:
+            raise ValueError(
+                "FrankaJointVelEnv requires 'gello_port' in the env config."
+            )
+        env = GelloJointIntervention(
+            env,
+            port=gello_port,
+            kp=float(cfg.get("gello_kp", 4.0)),
+            vmax=float(cfg.get("gello_vmax", 1.0)),
+            gripper_enabled=not cfg.get("no_gripper", False),
+        )
+    env = _apply_keyboard_reward(env, cfg.get("keyboard_reward_wrapper", None))
+    return env
+
+
 def apply_dual_arm_wrappers(env: gym.Env, cfg: Mapping[str, Any]) -> gym.Env:
     """Wrapper stack for dual-arm realworld envs (dual-franka today)."""
     if cfg.get("no_gripper", True):

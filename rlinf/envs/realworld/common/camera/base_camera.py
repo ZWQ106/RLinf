@@ -79,6 +79,15 @@ class BaseCamera(ABC):
         )
         return self._frame_queue.get(timeout=timeout)
 
+    def start_recording(self, svo_path: str) -> None:
+        """Begin recording the raw camera stream to a file. No-op by default;
+        cameras that support it (ZED SVO) override this."""
+        return None
+
+    def stop_recording(self) -> None:
+        """Stop recording started by :meth:`start_recording`. No-op by default."""
+        return None
+
     # ── internal ──────────────────────────────────────────────────────
 
     def _capture_frames(self):

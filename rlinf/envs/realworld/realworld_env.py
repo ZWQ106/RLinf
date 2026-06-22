@@ -123,6 +123,19 @@ class RealWorldEnv(gym.Env):
     def observation_space(self):
         return self.env.observation_space
 
+    def start_recording(self, svo_dir: str, tag: str) -> dict:
+        """Proxy per-episode SVO recording to the underlying single env.
+
+        The real env is wrapped in a SyncVectorEnv, so an outer wrapper's
+        get_wrapper_attr cannot reach the FrankaEnv method directly; delegate
+        through the vector env's call() (num_envs==1). Returns {cam_name: path}."""
+        results = self.env.call("start_recording", svo_dir, tag)
+        return results[0] if results else {}
+
+    def stop_recording(self) -> None:
+        """Proxy SVO stop to the underlying single env(s)."""
+        self.env.call("stop_recording")
+
     @property
     def total_num_group_envs(self):
         return np.iinfo(np.uint8).max // 2  # TODO

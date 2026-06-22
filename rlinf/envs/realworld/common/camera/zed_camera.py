@@ -18,6 +18,7 @@ Requires the ZED SDK to be installed system-wide (not pip-installable);
 the ``pyzed`` Python bindings are bundled with the SDK.
 """
 
+import time
 from typing import Optional
 
 import numpy as np
@@ -59,7 +60,9 @@ class ZEDCamera(BaseCamera):
         else:
             init_params.depth_mode = sl.DEPTH_MODE.NONE
 
-        status = self._camera.open(init_params)
+        status = self._open_with_retry(
+            self._camera, init_params, sl, camera_info.serial_number
+        )
         if status == sl.ERROR_CODE.SUCCESS:
             pass
         elif "CALIBRATION" in str(status):
@@ -72,12 +75,13 @@ class ZEDCamera(BaseCamera):
         else:
             raise RuntimeError(
                 f"Failed to open ZED camera "
-                f"(serial={camera_info.serial_number}): {status}"
+                f"(serial={camera_info.serial_number}) after retries: {status}"
             )
 
         self._image = sl.Mat()
         self._depth = sl.Mat() if camera_info.enable_depth else None
         self._runtime_params = sl.RuntimeParameters()
+        self._recording = False
 
     def _read_frame(self) -> tuple[bool, Optional[np.ndarray]]:
         if self._camera.grab(self._runtime_params) != self._sl.ERROR_CODE.SUCCESS:
@@ -97,6 +101,47 @@ class ZEDCamera(BaseCamera):
 
     def _close_device(self) -> None:
         self._camera.close()
+
+    def start_recording(self, svo_path: str) -> None:
+        """Record the raw HD camera stream to an SVO2 file (H264). Subsequent
+        background grab() calls write frames automatically until stop_recording."""
+        rp = self._sl.RecordingParameters(
+            svo_path, self._sl.SVO_COMPRESSION_MODE.H264
+        )
+        status = self._camera.enable_recording(rp)
+        if status != self._sl.ERROR_CODE.SUCCESS:
+            raise RuntimeError(
+                f"ZED enable_recording failed for {svo_path}: {status}"
+            )
+        self._recording = True
+
+    def stop_recording(self) -> None:
+        if getattr(self, "_recording", False):
+            self._camera.disable_recording()
+            self._recording = False
+
+    @staticmethod
+    def _open_with_retry(camera, init_params, sl, serial, attempts=3, settle_s=2.0):
+        """Open the ZED, retrying on transient failures.
+
+        Opening right after another process (e.g. the idle dashboard preview)
+        releases the camera can hit a transient "CAMERA MOTION SENSORS NOT
+        DETECTED" / "opening timeout reached" until the USB device is fully
+        reacquirable — more likely at HD1080. Retry a few times with a settle
+        delay; a CALIBRATION warning is treated as success (handled by caller)."""
+        status = None
+        for attempt in range(1, attempts + 1):
+            status = camera.open(init_params)
+            if status == sl.ERROR_CODE.SUCCESS or "CALIBRATION" in str(status):
+                return status
+            if attempt < attempts:
+                _logger.warning(
+                    "ZED open attempt %d/%d (serial=%s) failed: %s; retry in %.0fs",
+                    attempt, attempts, serial, status, settle_s,
+                )
+                camera.close()
+                time.sleep(settle_s)
+        return status
 
     _resolution_map: Optional[dict] = None
 

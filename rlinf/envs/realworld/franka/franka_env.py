@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import copy
+import os
 import queue
 import time
 from dataclasses import dataclass, field
@@ -55,6 +56,9 @@ class FrankaRobotConfig:
     # Each value is [top%, left%, bottom%, right%] in 0..1 range.
     # Example: {"230322271990": [0.0, 0.15, 1.0, 0.85]}
     camera_crop_regions: Optional[dict[str, list[float]]] = None
+    # ZED capture resolution [width, height], e.g. [1920, 1080] for HD1080.
+    # None -> CameraInfo default (VGA). Independent of the obs reshape (128).
+    camera_resolution: Optional[list[int]] = None
 
     is_dummy: bool = False
     use_dense_reward: bool = False
@@ -693,14 +697,15 @@ class FrankaEnv(gym.Env):
                     serial=serial,
                 )
 
-            camera_infos.append(
-                CameraInfo(
-                    name=name,
-                    serial_number=serial,
-                    camera_type=default_camera_type,
-                    crop_region=crop_region,
-                )
+            ci_kwargs = dict(
+                name=name,
+                serial_number=serial,
+                camera_type=default_camera_type,
+                crop_region=crop_region,
             )
+            if self.config.camera_resolution is not None:
+                ci_kwargs["resolution"] = tuple(self.config.camera_resolution)
+            camera_infos.append(CameraInfo(**ci_kwargs))
 
         return camera_infos
 
@@ -726,6 +731,25 @@ class FrankaEnv(gym.Env):
         for camera in self._cameras:
             camera.close()
         self._cameras = []
+
+    def start_recording(self, svo_dir: str, tag: str) -> dict[str, str]:
+        """Begin per-camera SVO recording. Returns {camera_name: svo_path}.
+        No-op (returns {}) in dummy mode or when there are no cameras."""
+        if self.config.is_dummy or not getattr(self, "_cameras", None):
+            return {}
+        os.makedirs(svo_dir, exist_ok=True)
+        paths: dict[str, str] = {}
+        for camera in self._cameras:
+            name = camera._camera_info.name
+            path = os.path.join(svo_dir, f"{tag}_{name}.svo2")
+            camera.start_recording(path)
+            paths[name] = path
+        return paths
+
+    def stop_recording(self) -> None:
+        """Stop SVO recording on all cameras (idempotent)."""
+        for camera in getattr(self, "_cameras", []):
+            camera.stop_recording()
 
     def _crop_frame(
         self,
@@ -782,7 +806,7 @@ class FrankaEnv(gym.Env):
                     ..., ::-1
                 ]  # Convert RGB to BGR
                 display_frames[camera._camera_info.name] = (
-                    resized_frame  # Original RGB for display
+                    frame  # full uncropped BGR frame for the live view
                 )
                 display_frames[f"{camera._camera_info.name}_full"] = (
                     cropped_frame  # Non-resized version

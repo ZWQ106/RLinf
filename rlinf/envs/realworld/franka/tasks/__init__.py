@@ -21,6 +21,7 @@ from gymnasium.envs.registration import register
 
 from rlinf.envs.realworld.common.wrappers import (
     apply_dual_arm_wrappers,
+    apply_single_arm_jointvel_wrappers,
     apply_single_arm_wrappers,
 )
 from rlinf.envs.realworld.franka.dual_franka_env import DualFrankaEnv as DualFrankaEnv
@@ -51,6 +52,24 @@ def create_franka_env(
         env_idx=env_idx,
     )
     return apply_single_arm_wrappers(env, env_cfg)
+
+
+def create_franka_jointvel_env(
+    override_cfg: dict[str, Any],
+    worker_info: Any,
+    hardware_info: Any,
+    env_idx: int,
+    env_cfg: Mapping[str, Any],
+) -> gym.Env:
+    from rlinf.envs.realworld.franka.franka_jointvel_env import FrankaJointVelEnv
+
+    env = FrankaJointVelEnv(
+        override_cfg=override_cfg,
+        worker_info=worker_info,
+        hardware_info=hardware_info,
+        env_idx=env_idx,
+    )
+    return apply_single_arm_jointvel_wrappers(env, env_cfg)
 
 
 def create_dual_franka_env(
@@ -136,6 +155,11 @@ def create_dexpnp_env(
 register(
     id="FrankaEnv-v1",
     entry_point="rlinf.envs.realworld.franka.tasks:create_franka_env",
+)
+
+register(
+    id="FrankaJointVelEnv-v1",
+    entry_point="rlinf.envs.realworld.franka.tasks:create_franka_jointvel_env",
 )
 
 register(

@@ -68,6 +68,9 @@ class DataCollector(Worker):
                 finalize_interval=getattr(
                     self.cfg.env.eval.data_collection, "finalize_interval", 100
                 ),
+                record_svo=getattr(
+                    self.cfg.env.eval.data_collection, "record_svo", False
+                ),
             )
 
         # Read from the wrapped action space so GripperCloseEnv / dual-arm all just work.

@@ -31,9 +31,10 @@ run_server.py. Key design facts preserved:
     container start. Call `bootstrap()` once before sending any motion or state
     read; subsequent calls are no-ops.
 """
-import time
+
 import logging
 import threading
+import time
 from typing import Sequence
 
 import numpy as np
@@ -86,18 +87,33 @@ class DroidZerorpcClient:
     # ---- lifecycle ----
 
     def bootstrap(self, settle_seconds: float = 8.0) -> None:
-        """Spawn polymetis driver + Robotiq driver inside the container,
-        then connect FrankaRobot's RobotInterface to them.
+        """Ensure the polymetis driver + RobotInterface are up.
 
-        Idempotent. First call takes ~10s. Subsequent calls are no-ops.
-        Must be called before any motion or state read.
+        Idempotent ACROSS PROCESSES: if a controller is already running and
+        healthy (get_robot_state succeeds — e.g. the dashboard left one up
+        from a Recover/Home), REUSE it and skip the launch. The server-side
+        FrankaRobot is shared across zerorpc clients, so re-launching would
+        force launch_controller to KILL the live driver and relaunch — that
+        kill+relaunch hangs (observed 2026-06-15: collection startup wedged
+        for minutes when a dashboard controller was already running). Only
+        do the full launch when no healthy controller exists.
         """
         self._check_thread()
         if self._bootstrapped:
             return
+        # Already-healthy controller? Reuse it — no kill+relaunch.
+        try:
+            self._fast.get_robot_state()
+            self._bootstrapped = True
+            _log.info("bootstrap: controller already healthy, reusing (no relaunch)")
+            return
+        except Exception:
+            pass
         _log.info("bootstrap step 1/3: launch_controller (spawn polymetis driver)")
         self._client.launch_controller()
-        _log.info("bootstrap step 2/3: sleep %.1fs to let driver come up", settle_seconds)
+        _log.info(
+            "bootstrap step 2/3: sleep %.1fs to let driver come up", settle_seconds
+        )
         time.sleep(settle_seconds)
         _log.info("bootstrap step 3/3: launch_robot (connect RobotInterface)")
         self._client.launch_robot()
@@ -127,7 +143,9 @@ class DroidZerorpcClient:
             "motor_torques_measured": np.asarray(state["motor_torques_measured"]),
             "cartesian_position": np.asarray(state["cartesian_position"]),
             "gripper_position": float(state["gripper_position"]),
-            "prev_command_successful": bool(state.get("prev_command_successful", False)),
+            "prev_command_successful": bool(
+                state.get("prev_command_successful", False)
+            ),
             "prev_controller_latency_ms": float(
                 state.get("prev_controller_latency_ms", 0.0)
             ),
@@ -193,7 +211,9 @@ class DroidZerorpcClient:
         action = q + [float(gripper_cmd)]
         self._client.update_command(action, "joint_position", None, blocking)
 
-    def update_cartesian_position(self, pose_6d: Sequence[float], gripper_cmd: float = 0.0) -> None:
+    def update_cartesian_position(
+        self, pose_6d: Sequence[float], gripper_cmd: float = 0.0
+    ) -> None:
         """One non-blocking absolute EE target. 6D [xyz + euler-xyz] + gripper.
 
         Args:
@@ -208,8 +228,13 @@ class DroidZerorpcClient:
         assert len(a) == 7
         self._fast.update_command(a, "cartesian_position", "position", False)
 
-    def stream_joint_position(self, q7: Sequence[float], duration_s: float = 2.0, hz: int = 15,
-                              gripper_cmd: float = 0.0) -> None:
+    def stream_joint_position(
+        self,
+        q7: Sequence[float],
+        duration_s: float = 2.0,
+        hz: int = 15,
+        gripper_cmd: float = 0.0,
+    ) -> None:
         """Streamed joint reset — a blocking one-shot is a no-op for small
         displacement (DROID adaptive_time_to_go=0 gotcha).
 
@@ -235,6 +260,41 @@ class DroidZerorpcClient:
         assert len(a) == 8
         for _ in range(int(duration_s * hz)):
             self._fast.update_command(a, "joint_position", "position", False)
+            time.sleep(1.0 / hz)
+
+    def leashed_move_to_joint(
+        self,
+        q7: Sequence[float],
+        gripper_cmd: float = 0.0,
+        max_step: float = 0.06,
+        hz: int = 15,
+        timeout_s: float = 25.0,
+        tol: float = 0.03,
+    ) -> float:
+        """Speed-bounded joint move; returns max joint error (rad).
+
+        Each tick reads the ACTUAL joint position and commands an impedance
+        setpoint at most `max_step` rad ahead toward the target, so the
+        impedance error (hence torque, hence speed ~= max_step*hz) is bounded
+        — no full-speed lunge, no Franka velocity/accel reflex. `stream_joint_
+        position` (constant final target) lunges from a far pose; blocking
+        move_to_joint_positions WEDGES the polymetis gRPC server. max_step=0.06
+        because a gravity-loaded wrist joint won't track a smaller setpoint
+        error (verified on hardware 2026-06-15).
+        """
+        self._check_thread()
+        target = [float(x) for x in q7]
+        deadline = time.monotonic() + timeout_s
+        maxerr = float("inf")
+        while True:
+            cur = [float(x) for x in self._fast.get_robot_state()[0]["joint_positions"]]
+            err = [t - c for t, c in zip(target, cur)]
+            maxerr = max(abs(e) for e in err)
+            if maxerr < tol or time.monotonic() > deadline:
+                return maxerr
+            sp = [c + max(-max_step, min(max_step, e)) for c, e in zip(cur, err)]
+            self._fast.update_command(sp + [float(gripper_cmd)],
+                                      "joint_position", "position", False)
             time.sleep(1.0 / hz)
 
     # ---- gripper standalone ----

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import atexit
 import copy
+import json
 import os
 import pickle
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -72,6 +73,7 @@ class CollectEpisode(gym.Wrapper):
         fps: int = 10,
         only_success: bool = False,
         finalize_interval: int = 100,
+        record_svo: bool = False,
     ):
         if isinstance(env, gym.Env):
             super().__init__(env)
@@ -93,6 +95,11 @@ class CollectEpisode(gym.Wrapper):
         self.fps = fps
         self.only_success = only_success
         self.finalize_interval = finalize_interval
+
+        self.record_svo = record_svo
+        self._svo_dir = os.path.join(os.path.dirname(save_dir.rstrip("/")), "svo")
+        self._svo_active: dict[str, str] = {}
+        self._svo_kept = 0
 
         # LeRobot writer is created lazily on the first completed episode.
         if export_format == "lerobot":
@@ -159,6 +166,7 @@ class CollectEpisode(gym.Wrapper):
 
         self._show_goal_site_visual()
         self._record_reset_obs(obs)
+        self._start_svo()
         return obs, info
 
     def step(self, action, **kwargs):
@@ -336,14 +344,87 @@ class CollectEpisode(gym.Wrapper):
             if self.only_success:
                 if is_success and done_by_term:
                     self._flush_episode(env_idx, is_success)
+                    self._finalize_svo(env_idx, kept=True)
                     self._reset_env_buffer(env_idx)
                 else:
                     if done_by_trunc:
+                        self._finalize_svo(env_idx, kept=False)
                         self._reset_env_buffer(env_idx)
+                    elif done_by_term:
+                        # Failed-terminate (operator 'a' abort): not a success, so
+                        # not flushed and (matching the pre-SVO behavior) the buffer
+                        # is rebuilt by the next reset(); but the SVO MUST still be
+                        # stopped + discarded here, else the recording handle leaks
+                        # and the next _start_svo re-enables a still-recording camera.
+                        self._finalize_svo(env_idx, kept=False)
             else:
                 if done_by_term or done_by_trunc:
                     self._flush_episode(env_idx, is_success)
+                    self._finalize_svo(env_idx, kept=is_success)
                     self._reset_env_buffer(env_idx)
+
+    def _start_svo(self) -> None:
+        if not self.record_svo:
+            return
+        try:
+            stop = self.get_wrapper_attr("stop_recording")
+            start = self.get_wrapper_attr("start_recording")
+        except (AttributeError, ValueError):
+            self.logger.warning(
+                "record_svo=True but the env exposes no start_recording "
+                "(get_wrapper_attr failed); SVO recording disabled this run."
+            )
+            return
+        try:
+            # Defensive: release any recording still open from a prior episode
+            # (e.g. an abort path that didn't finalize) before starting a new one.
+            stop()
+            tag = f"_rec_{self._global_step}"
+            self._svo_active = start(self._svo_dir, tag) or {}
+        except Exception as e:
+            # SVO is auxiliary; never let a recording-start failure kill the run.
+            self.logger.warning(
+                f"SVO start failed; collecting this episode without SVO: {e}"
+            )
+            self._svo_active = {}
+
+    def _finalize_svo(self, env_idx: int, kept: bool) -> None:
+        if not self.record_svo:
+            return
+        try:
+            self.get_wrapper_attr("stop_recording")()
+        except (AttributeError, ValueError):
+            pass
+        active, self._svo_active = self._svo_active, {}
+        if not active:
+            return
+        # SVO is auxiliary; the LeRobot episode is already flushed by now, so a
+        # rename/index hiccup must NOT propagate into _maybe_flush and kill the
+        # collection loop. Log and swallow.
+        try:
+            if not kept:
+                for p in active.values():
+                    if os.path.exists(p):
+                        os.remove(p)
+                return
+            idx = self._svo_kept
+            self._svo_kept += 1
+            kept_files = []
+            for name, temp in active.items():
+                dst = os.path.join(self._svo_dir, f"episode_{idx}_{name}.svo2")
+                if os.path.exists(temp):
+                    os.replace(temp, dst)
+                    kept_files.append(os.path.basename(dst))
+            index_path = os.path.join(self._svo_dir, "svo_index.json")
+            index = {}
+            if os.path.exists(index_path):
+                with open(index_path) as f:
+                    index = json.load(f)
+            index[str(idx)] = kept_files
+            with open(index_path, "w") as f:
+                json.dump(index, f, indent=2)
+        except Exception as e:
+            self.logger.warning(f"SVO finalize failed (LeRobot episode already saved): {e}")
 
     def _flush_episode(self, env_idx: int, is_success: bool) -> None:
         """Dispatch a completed episode to the appropriate format writer."""

@@ -1,0 +1,18 @@
+# Pilot-run returns computation for the 2026-06-12 bench dataset
+data:
+  data_root: null
+  train_data_paths:
+    - dataset_path: /opt/.cache/huggingface/lerobot/outputs/pilot/collected_data/rank_0/id_0
+      type: rollout
+  dataset_type: "rollout"
+  gamma: 1.0
+  failure_reward: -300.0
+  tag: pilot
+  num_workers: 8
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  job:
+    chdir: false
