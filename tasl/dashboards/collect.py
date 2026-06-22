@@ -2018,15 +2018,29 @@ def build_app(cams: CamManager, mgr: CollectionManager,
     @robot_gated
     def api_robot_recover():
         # Synchronous on purpose — the operator is waiting at the bench.
-        # 30s timeout client: launch_controller alone takes ~10s.
-        client = DroidClient(timeout=30)
+        # 90s timeout: a COLD launch_controller (container just up + FCI just
+        # activated) can exceed the old 30s and finish server-side AFTER the
+        # client gives up. So on a bootstrap RPC error we re-check the state and
+        # treat a live controller as success — no false 500.
+        client = DroidClient(timeout=90)
         try:
             try:
                 client.kill_controller()
             except Exception as e:
                 # Controller may already be dead — that's what we're recovering.
                 _log.warning(f"kill_controller during recover: {e}")
-            client.bootstrap()
+            try:
+                client.bootstrap()
+            except Exception as e:
+                _log.warning(f"bootstrap RPC error during recover: {e!r}; re-checking state")
+                rc = DroidClient(timeout=8)
+                try:
+                    rc.get_robot_state()  # raises if the controller really isn't up
+                except Exception:
+                    raise e
+                finally:
+                    rc.close()
+                return jsonify({"ok": True, "msg": "recover done (controller live; bootstrap RPC was slow)"})
             return jsonify({"ok": True, "msg": "recover done (controller relaunched)"})
         except Exception as e:
             return jsonify({"ok": False, "msg": f"recover failed: {e!r}"[:300]}), 500
