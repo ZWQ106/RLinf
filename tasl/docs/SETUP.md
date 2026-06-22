@@ -106,14 +106,16 @@ ss -tlnp | grep ':4242'          # zerorpc listening
 ```
 (`teleop.sh` on the Desktop does this for you over ssh.)
 
-**Known config debt on NUC1 (found 2026-06-22):**
-- `franka-robot-server` is **`enabled`** (auto-starts on boot) — on a reboot it
-  would grab FCI/`:4242` and fight the droid container (`restart: unless-stopped`).
-  Recommend `sudo systemctl disable franka-robot-server`.
-- `parameters.py` `laptop_ip` and compose `LAPTOP_IP` are the **stale Tailscale IP**
-  `100.66.31.78` (Desktop is now `100.79.65.37`). Informational, but stale.
-- Compose env `LIBFRANKA_VERSION: "0.13.5"` is misleading — the image actually
-  ships **0.18.1** (the var is unused; the version is baked into the image).
+**NUC1 config notes (2026-06-22):**
+- ✅ **FIXED** — `franka-robot-server` was `enabled` (boot FCI-conflict risk);
+  now `disabled` (`systemctl disable`). Service stays `inactive`; re-enable only
+  if you switch the bench back to the franky stack.
+- ✅ **FIXED** — `parameters.py laptop_ip` + compose `LAPTOP_IP` corrected from the
+  stale `100.66.31.78` to `100.79.65.37` (`.bak-ipfix` backups kept on NUC1).
+  Note: compose env changes apply on the next `docker compose up -d` recreate.
+- ⚠ **Remaining** — compose env `LIBFRANKA_VERSION: "0.13.5"` is misleading; the
+  image actually ships **0.18.1** (the var is unused — version baked into the
+  image). Left as-is to avoid implying a rebuild.
 
 ---
 
