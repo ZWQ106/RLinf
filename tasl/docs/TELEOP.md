@@ -13,7 +13,7 @@ component map see [ARCHITECTURE.md](ARCHITECTURE.md).
 sudo ~/RLinf/tasl/launch/teleop.sh        # → activate FCI when prompted → auto-homes
 
 # then in the dashboard (laptop or Desktop browser):
-#   http://100.79.65.37:8004   (Tailscale)   — move GELLO, press Start, mark Success, Stop
+#   http://<address shown in concole>:8004   (Tailscale)   — move GELLO, press Start, mark Success, Stop
 
 # DONE for the session (release FCI, free everything):
 sudo ~/RLinf/tasl/launch/teleop-stop.sh
