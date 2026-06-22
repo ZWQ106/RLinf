@@ -47,6 +47,7 @@ class LeRobotDatasetWriter:
     def create(
         self,
         repo_id: str,
+        root: str | None = None,
         robot_type: str = "franka_panda",
         fps: int = 5,
         features: dict[str, dict[str, Any]] | None = None,
@@ -65,6 +66,8 @@ class LeRobotDatasetWriter:
 
         Args:
             repo_id: The identifier for the new LeRobot dataset
+            root: Explicit on-disk root for the dataset. If None, lerobot uses
+                its default (HF_LEROBOT_HOME/repo_id).
             robot_type: Robot type (default "franka_panda")
             fps: Frame rate (default 5)
             features: Feature schema dictionary defining the dataset structure.
@@ -136,12 +139,32 @@ class LeRobotDatasetWriter:
         )
         self.dataset = LeRobotDataset.create(
             repo_id=repo_id,
+            root=root,
             robot_type=robot_type,
             fps=fps,
             features=features,
             image_writer_threads=image_writer_threads,
             image_writer_processes=image_writer_processes,
         )
+
+    def open_or_create(
+        self, repo_id: str, root: str | None = None, **create_kwargs
+    ) -> None:
+        """Open an existing LeRobotDataset at `root` if present, else create it.
+
+        Enables cross-session accumulation: reopening reads meta.total_episodes so
+        save_episode continues the episode_index instead of overwriting.
+        """
+        import os
+
+        from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+
+        if root is not None and os.path.isfile(
+            os.path.join(root, "meta", "info.json")
+        ):
+            self.dataset = LeRobotDataset(repo_id, root=root)
+        else:
+            self.create(repo_id=repo_id, root=root, **create_kwargs)
 
     def add_episode(self, episode_data: list[dict[str, Any]]) -> None:
         """
