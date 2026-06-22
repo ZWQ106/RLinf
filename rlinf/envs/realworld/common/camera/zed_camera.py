@@ -18,6 +18,7 @@ Requires the ZED SDK to be installed system-wide (not pip-installable);
 the ``pyzed`` Python bindings are bundled with the SDK.
 """
 
+import threading
 import time
 from typing import Optional
 
@@ -82,21 +83,26 @@ class ZEDCamera(BaseCamera):
         self._depth = sl.Mat() if camera_info.enable_depth else None
         self._runtime_params = sl.RuntimeParameters()
         self._recording = False
+        # Serializes camera SDK calls: the background grab thread vs.
+        # enable/disable_recording on the control thread. disable_recording
+        # racing an in-flight grab() corrupts the SVO trailer ("INVALID SVO
+        # FILE"), which only shows up on long episodes (more grabs = more race).
+        self._cam_lock = threading.Lock()
 
     def _read_frame(self) -> tuple[bool, Optional[np.ndarray]]:
-        if self._camera.grab(self._runtime_params) != self._sl.ERROR_CODE.SUCCESS:
-            return False, None
-
-        self._camera.retrieve_image(self._image, self._sl.VIEW.LEFT)
-        # BGRA → BGR (strip alpha to match RealSense output)
-        frame = self._image.get_data()[:, :, :3].copy()
-
-        if self._depth is not None:
-            self._camera.retrieve_measure(self._depth, self._sl.MEASURE.DEPTH)
-            depth_data = self._depth.get_data()
-            depth = np.expand_dims(depth_data, axis=2)
-            return True, np.concatenate((frame, depth), axis=-1)
-
+        # Hold _cam_lock across grab + retrieve so a concurrent
+        # enable/disable_recording can't corrupt the in-flight SVO write.
+        with self._cam_lock:
+            if self._camera.grab(self._runtime_params) != self._sl.ERROR_CODE.SUCCESS:
+                return False, None
+            self._camera.retrieve_image(self._image, self._sl.VIEW.LEFT)
+            # BGRA → BGR (strip alpha to match RealSense output)
+            frame = self._image.get_data()[:, :, :3].copy()
+            if self._depth is not None:
+                self._camera.retrieve_measure(self._depth, self._sl.MEASURE.DEPTH)
+                depth_data = self._depth.get_data()
+                depth = np.expand_dims(depth_data, axis=2)
+                return True, np.concatenate((frame, depth), axis=-1)
         return True, frame
 
     def _close_device(self) -> None:
@@ -108,7 +114,8 @@ class ZEDCamera(BaseCamera):
         rp = self._sl.RecordingParameters(
             svo_path, self._sl.SVO_COMPRESSION_MODE.H264
         )
-        status = self._camera.enable_recording(rp)
+        with self._cam_lock:
+            status = self._camera.enable_recording(rp)
         if status != self._sl.ERROR_CODE.SUCCESS:
             raise RuntimeError(
                 f"ZED enable_recording failed for {svo_path}: {status}"
@@ -117,7 +124,10 @@ class ZEDCamera(BaseCamera):
 
     def stop_recording(self) -> None:
         if getattr(self, "_recording", False):
-            self._camera.disable_recording()
+            # Lock so disable_recording finalizes the SVO trailer without a
+            # concurrent grab() corrupting it.
+            with self._cam_lock:
+                self._camera.disable_recording()
             self._recording = False
 
     @staticmethod
