@@ -4,7 +4,7 @@
 # RUN THIS ON THE DESKTOP (TASL-1). No prior context needed:
 #     ./start_collect.sh            # it re-runs itself under sudo
 # It checks the robot, frees the cameras, (re)starts the rlinf-eval container,
-# and launches the collect dashboard. Then open http://100.66.31.78:8004 .
+# and launches the collect dashboard. Then open the Tailscale URL printed at the end.
 #
 # Prereqs it does NOT do for you (it will tell you if missing):
 #   • FR3 powered + FCI active in Desk
@@ -27,7 +27,7 @@ desk "docker exec rlinf-eval bash -lc 'pkill -9 -f \"[r]ay::DataCollector\"; pki
 ok "clean slate"
 
 step "Stop any existing collect dashboard (idempotent re-run)"
-desk "pkill -TERM -f 'dashboards/collect[.]py' || true"
+desk "pkill -TERM -f '[/_]collect[.]py' || true"
 if [[ -z "$LAUNCH_DRY_RUN" ]]; then sleep 2; fi
 
 step "Launch collect dashboard :8004 (--no-cam-on-start)"
@@ -39,4 +39,4 @@ step "vkbd handoff: docker restart rlinf-eval so the in-container 's'/'c' listen
 desk "docker restart rlinf-eval"
 ok "vkbd handoff done"
 
-ok "READY — collect dashboard at http://100.66.31.78:8004 (Tailscale)"
+ok "READY — collect dashboard at http://$TS_IP:8004 (Tailscale; robot-net IP if TS offline)"

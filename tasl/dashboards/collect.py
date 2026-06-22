@@ -587,7 +587,7 @@ class CollectionManager:
         own argv from matching itself (kept even though argv-style
         subprocess has no shell line — this pattern has bitten us)."""
         try:
-            r = subprocess.run(["pgrep", "-f", "dashboards/openpi[.]py"],
+            r = subprocess.run(["pgrep", "-f", "[/_]openpi[.]py"],
                                capture_output=True, text=True, timeout=5.0)
         except Exception as e:
             _log.warning(f"legacy dashboard pgrep failed: {e}")

@@ -4,7 +4,7 @@
 # RUN THIS ON THE DESKTOP (TASL-1). No prior context needed:
 #     ./start_openpi.sh             # it re-runs itself under sudo
 # It checks the robot, guards the GPU, ensures the openpi serve_policy (:8000)
-# is up, and launches the eval dashboard. Then open http://100.66.31.78:8003 .
+# is up, and launches the eval dashboard. Then open the Tailscale URL printed at the end.
 #
 # Prereqs it does NOT do for you (it will tell you if missing):
 #   • FR3 powered + FCI active in Desk
@@ -31,10 +31,10 @@ else
 fi
 
 step "Stop any existing openpi dashboard (idempotent re-run)"
-desk "pkill -TERM -f 'dashboards/openpi[.]py' || true"
+desk "pkill -TERM -f '[/_]openpi[.]py' || true"
 if [[ -z "$LAUNCH_DRY_RUN" ]]; then sleep 2; fi
 
 step "Launch openpi dashboard :8003 (--policy-host 127.0.0.1 --policy-port 8000)"
 desk "cd $TASL && ulimit -n 8192 && PYTHONPATH=$TASL:$SITE_PKGS:$DESKTOP_HOME/work/openpi/packages/openpi-client/src setsid /usr/bin/python3 dashboards/openpi.py --port 8003 --policy-host 127.0.0.1 --policy-port 8000 </dev/null >> $TASL/logs/openpi.log 2>&1 &"
 wait_http 8003 || die "openpi dashboard did not answer on :8003 (see $TASL/logs/openpi.log)"
-ok "READY — openpi dashboard at http://100.66.31.78:8003 (Tailscale)"
+ok "READY — openpi dashboard at http://$TS_IP:8003 (Tailscale; robot-net IP if TS offline)"

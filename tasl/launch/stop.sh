@@ -14,13 +14,13 @@ what="${1:-all}"
 
 stop_collect() {
   step "Stop collect dashboard + reap collection procs"
-  desk "pkill -TERM -f '[_]dashboard_collect.py' || true"
+  desk "pkill -TERM -f '[/_]collect[.]py' || true"
   desk "docker exec rlinf-eval bash -lc 'pkill -9 -f \"[r]ay::DataCollector\"; pkill -9 -f \"[c]ollect_real_data\"; pkill -9 -f \"[P]olymetisController\"; /opt/venv/openpi/bin/ray stop --force 2>/dev/null; rm -rf /tmp/ray; true' || true"
   ok "collect stopped"
 }
 stop_openpi() {
   step "Stop openpi dashboard"
-  desk "pkill -TERM -f '[_]dashboard_openpi.py' || true"
+  desk "pkill -TERM -f '[/_]openpi[.]py' || true"
   ok "openpi stopped"
 }
 

@@ -3,11 +3,31 @@ import pyzed.sl as sl
 import threading
 import time
 import io
+import subprocess
 from PIL import Image
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 
 PORT = 8002
+
+
+def host_ip() -> str:
+    """Laptop-facing host IP: Tailscale if up, else the robot-net (172.16.0.x)."""
+    try:
+        ip = subprocess.check_output(["tailscale", "ip", "-4"], text=True,
+                                     timeout=3).splitlines()[0].strip()
+        if ip:
+            return ip
+    except Exception:
+        pass
+    try:
+        ips = subprocess.check_output(["hostname", "-I"], text=True, timeout=3).split()
+        for ip in ips:
+            if ip.startswith("172.16.0."):
+                return ip
+        return ips[0] if ips else "<host>"
+    except Exception:
+        return "<host>"
 RESOLUTION = sl.RESOLUTION.HD720
 FPS = 15
 JPEG_QUALITY = 70
@@ -117,7 +137,7 @@ def main():
     for t in threads: t.start()
     time.sleep(2)  # let first frames land
     print(f"serving on http://0.0.0.0:{PORT}")
-    print(f"  open http://100.66.31.78:{PORT} in your browser")
+    print(f"  open http://{host_ip()}:{PORT} in your browser")
     srv = ThreadingServer(("0.0.0.0", PORT), Handler)
     try:
         srv.serve_forever()

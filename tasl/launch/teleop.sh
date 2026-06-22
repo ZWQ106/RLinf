@@ -82,7 +82,7 @@ zeds_free || die "ZEDs not both free/present — reseat the exterior 2i USB; ens
 step "  reap stale collection procs in rlinf-eval"
 desk "docker exec rlinf-eval bash -lc 'pkill -9 -f \"[r]ay::DataCollector\"; pkill -9 -f \"[c]ollect_real_data\"; pkill -9 -f \"[P]olymetisController\"; /opt/venv/openpi/bin/ray stop --force 2>/dev/null; rm -rf /tmp/ray; true'"
 step "  stop any existing collect dashboard (idempotent)"
-desk "pkill -TERM -f 'dashboards/collect[.]py' || true"
+desk "pkill -TERM -f '[/_]collect[.]py' || true"
 [[ -z "$LAUNCH_DRY_RUN" ]] && sleep 2
 step "  launch collect dashboard :8004 (--no-cam-on-start)"
 desk "cd $TASL && ulimit -n 8192 && PYTHONPATH=$TASL:$SITE_PKGS NUC1_HOST=$NUC1_HOST setsid /usr/bin/python3 dashboards/collect.py --port 8004 --no-cam-on-start </dev/null >> $TASL/logs/collect.log 2>&1 &"
@@ -106,4 +106,4 @@ else
   echo "DRY: curl -X POST $DASH/api/robot/home"
 fi
 
-ok "READY — open http://$(hostname -I | awk '{print $1}'):8004 , move the GELLO leader, press Start to record."
+ok "READY — open http://$TS_IP:8004 (laptop, via Tailscale), move the GELLO leader, press Start to record."

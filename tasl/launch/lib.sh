@@ -18,6 +18,14 @@ ZED_WRIST=17150101
 NUC1_HOST="${NUC1_HOST:-172.16.0.2}"
 NUC1_SSH="${NUC1_SSH:-tasl@$NUC1_HOST}"
 ZERORPC_ADDR="tcp://$NUC1_HOST:4242"
+# Desktop dashboard host for the laptop. Prefer the Tailscale IP (derived LIVE
+# so it can never go stale); if tailscale is offline, fall back to the
+# robot-network IP (172.16.0.x). Override with TS_IP=… if needed.
+TS_IP="${TS_IP:-$(tailscale ip -4 2>/dev/null | head -1)}"
+if [[ -z "$TS_IP" ]]; then
+  TS_IP="$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^172\.16\.0\.' | head -1)"
+  TS_IP="${TS_IP:-$(hostname -I 2>/dev/null | awk '{print $1}')}"   # last resort: first IP
+fi
 DESKTOP_HOME=/home/franka_desktop
 REPO="$DESKTOP_HOME/RLinf"          # consolidated fork checkout (tasl-lab/RLinf)
 TASL="$REPO/tasl"                   # bench operator tooling lives here
@@ -105,7 +113,7 @@ wait_http() {
 # arg1 = which dashboard we are starting (collect|openpi).
 kill_other_dashboard() {
   local me="$1" pat
-  if [[ "$me" == collect ]]; then pat="dashboards/openpi[.]py"; else pat="dashboards/collect[.]py"; fi
+  if [[ "$me" == collect ]]; then pat="[/_]openpi[.]py"; else pat="[/_]collect[.]py"; fi
   desk "pkill -TERM -f '$pat' || true"
 }
 
