@@ -12,9 +12,8 @@ For day-to-day operation see [TELEOP.md](TELEOP.md); for the component model see
 DROID image build) lives in the Notion "Franka Install" doc — this guide is the
 repo-local summary plus the parts verified on the live machines.
 
-> **Scope note.** The Desktop section is verified against the running machine.
-> The NUC1 section is reconstructed from the bench handoff — the NUC is a
-> separate box this guide can't introspect, so **verify those steps on NUC1**.
+> **Scope note.** Both sections are verified against the live machines
+> (Desktop and NUC1 inspected 2026-06-22).
 
 ---
 
@@ -54,10 +53,10 @@ ping -c1 172.16.0.1 && ping -c1 172.16.0.2     # FR3 + NUC1 reachable
 
 ---
 
-## 3. NUC1 setup (controller)  ⚠ verify on the NUC
+## 3. NUC1 setup (controller)  ✅ verified 2026-06-22
 
-**Base:** Ubuntu 22.04 + **RT kernel** (5.15-rt), user `tasl`, Docker installed,
-`tasl` in the `docker` group. Cat6 to the FR3.
+**Base:** Ubuntu **22.04.5** + **RT kernel `5.15.0-1105-realtime`**, user `tasl`,
+Docker installed, `tasl` in the `docker` group. Cat6 to the FR3.
 
 **The controller lives in `~/polymetis_fr3/`:**
 ```
@@ -90,9 +89,12 @@ the **`polymetis-local` conda env** (`source /root/miniconda3/etc/profile.d/cond
   recover/bootstrap does this; ~10 s cold).
 - **zerorpc drops kwargs** — always pass `update_command` args positionally
   (`_droid_client.py` / the env client already wrap this).
-- The **gripper** is driven through this container over zerorpc. The current
-  end-effector is the Franka Hand — **confirm the launch_gripper config matches**
-  (the older handoff referenced a Robotiq/ttyUSB driver; verify what's wired).
+- The **gripper** is driven through this container over zerorpc. **Verified: it
+  runs a Robotiq 2F** — `launch_gripper.py gripper=robotiq_2f
+  gripper.comport=/dev/ttyUSB0` (FTDI USB-RS485 bridge `0403:6015` on `ttyUSB0`,
+  driver actively running). ⚠ This contradicts the "Franka Hand" assumption
+  elsewhere — confirm which end-effector is physically mounted; the data's
+  gripper channel comes from this Robotiq driver.
 
 **FCI exclusivity — the #1 footgun:** only one libfranka client at a time. The
 franky **`franka-robot-server` systemd unit must stay STOPPED** whenever the
@@ -103,6 +105,15 @@ cd ~/polymetis_fr3 && docker compose up -d
 ss -tlnp | grep ':4242'          # zerorpc listening
 ```
 (`teleop.sh` on the Desktop does this for you over ssh.)
+
+**Known config debt on NUC1 (found 2026-06-22):**
+- `franka-robot-server` is **`enabled`** (auto-starts on boot) — on a reboot it
+  would grab FCI/`:4242` and fight the droid container (`restart: unless-stopped`).
+  Recommend `sudo systemctl disable franka-robot-server`.
+- `parameters.py` `laptop_ip` and compose `LAPTOP_IP` are the **stale Tailscale IP**
+  `100.66.31.78` (Desktop is now `100.79.65.37`). Informational, but stale.
+- Compose env `LIBFRANKA_VERSION: "0.13.5"` is misleading — the image actually
+  ships **0.18.1** (the var is unused; the version is baked into the image).
 
 ---
 
@@ -188,6 +199,8 @@ cd ~/RLinf && git checkout franka-fr3/bench
 | FR3 firmware | 5.9.2 (FCI protocol 10) |
 | libfranka (NUC container) | 0.18.1 |
 | NUC image | `droid-nuc-fr3:0.18.1` (base `ghcr.io/droid-dataset/droid_nuc:fr3`) |
+| NUC OS / kernel | Ubuntu 22.04.5 / `5.15.0-1105-realtime` |
+| Gripper | **Robotiq 2F** via `/dev/ttyUSB0` (FTDI `0403:6015`), `gripper=robotiq_2f` |
 | Desktop OS / kernel | Ubuntu 22.04.5 / 6.8 |
 | NVIDIA driver | 570.211.01 (RTX 4090) |
 | ZED SDK / pyzed | 5.3.0 |
