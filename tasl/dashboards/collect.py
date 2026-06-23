@@ -119,9 +119,19 @@ DROID_HOME_Q = [0.0, -0.6283, 0.0, -2.5133, 0.0, 1.8850, 0.0]
 
 VIRTUAL_KBD_NAME = "tasl-collect-dashboard-kbd"
 
-# Dataset manager (Task C). New HF_LEROBOT_HOME bind mount, host path on
-# the Desktop. Override with --dataset-roots (comma-separated).
-DATASET_ROOTS = ["/home/franka_desktop/work/rlinf-clone/outputs/lerobot"]
+# Dataset manager. Host paths on the Desktop (the rlinf-clone bind mount).
+# Order is significant: root_index 0 = "current" scheme (fixed repo_id/root
+# datasets written under datasets/<name>), 1 = "legacy" (old per-run
+# timestamped outputs/lerobot/...). The UI groups + labels by this index.
+# Override with --dataset-roots (comma-separated, current-first).
+DATASET_ROOTS = [
+    "/home/franka_desktop/work/rlinf-clone/datasets",
+    "/home/franka_desktop/work/rlinf-clone/outputs/lerobot",
+]
+# Container-internal dataset root prefix (mounted as the host DATASET_ROOTS[0]).
+# Start passes repo_id/root/svo_dir under this so collect_real_data.py (running
+# inside rlinf-eval) writes to the bind-mounted location, visible on the host.
+CONTAINER_DATASET_ROOT = "/workspace/rlinf/datasets"
 # Pre-migration datasets inside the container (notice only, never scanned).
 LEGACY_CONTAINER_LEROBOT = "/opt/.cache/huggingface/lerobot"
 PLAYBACK_MAX_FPS = 10.0
@@ -623,7 +633,8 @@ class CollectionManager:
             _log.warning(f"orphan collection reap failed: {e}")
 
     # -- lifecycle --------------------------------------------------------
-    def start(self, num_episodes: int, task_description: str) -> str:
+    def start(self, num_episodes: int, task_description: str,
+              dataset_name: Optional[str] = None) -> str:
         with self._lock:
             # Always start from a clean slate: reap any stray collection inside
             # the container (orphan Ray actors / a leftover collect_real_data
@@ -662,12 +673,24 @@ class CollectionManager:
             override = shlex.quote(
                 f"env.eval.override_cfg.task_description={task_description}"
             )
-            # Unique per-run dataset dir. LeRobotDataset.create() raises
-            # FileExistsError if its target dir already exists, so reusing a
-            # fixed save_dir crashes every run after the first success
-            # (observed 2026-06-15: episode 1 saved, then FileExistsError on
-            # outputs/pilot/.../id_0 killed the run + the controller actor).
-            # A timestamped log_path makes each Start its own clean dataset.
+            # Dataset selection: when a name is given, pin the fixed repo_id/root
+            # so episodes ACCUMULATE into datasets/<name> across Starts (the new
+            # open_or_create writer reopens an existing dataset instead of the old
+            # FileExistsError-on-create, which is why the historic timestamped
+            # save_dir workaround is no longer needed). svo_dir is the HD sibling.
+            ds_override = ""
+            if dataset_name:
+                if not _valid_dataset_name(dataset_name):
+                    return ("refused: invalid dataset name "
+                            "(allowed: letters, digits, . _ -)")
+                dc = "env.eval.data_collection"
+                ds_override = (
+                    f"{dc}.repo_id=tasl/{dataset_name} "
+                    f"{dc}.root={CONTAINER_DATASET_ROOT}/{dataset_name} "
+                    f"{dc}.svo_dir={CONTAINER_DATASET_ROOT}/{dataset_name}_svo "
+                )
+            # log_path now only holds tensorboard logs (the dataset lands at the
+            # fixed root above); a timestamp keeps each run's logs separate.
             run_tag = time.strftime("%Y%m%d_%H%M%S")
             log_path = shlex.quote(f"./outputs/collect_{run_tag}")
             launch_cmd = (
@@ -685,6 +708,7 @@ class CollectionManager:
                 f"runner.num_data_episodes={int(num_episodes)} "
                 f"runner.logger.log_path={log_path} "
                 f"{override} "
+                f"{ds_override}"
                 f"> {COLLECT_LOG} 2>&1"
             )
             try:
@@ -703,10 +727,12 @@ class CollectionManager:
             self.last_launch = {
                 "num_episodes": int(num_episodes),
                 "task_description": task_description,
+                "dataset_name": dataset_name,
                 "started_at": time.time(),
             }
             msg = (f"started: {num_episodes} episode(s), "
-                   f"task={task_description!r}")
+                   f"task={task_description!r}"
+                   + (f", dataset={dataset_name!r}" if dataset_name else ""))
             # Fresh launch = the moment to recheck container visibility:
             # collection still starts (physical 'c' always works), but warn
             # if the dashboard's mark-success injection can't land.
@@ -856,6 +882,19 @@ def dsid_decode(dsid: str) -> tuple[int, str]:
     return int(idx_s), name
 
 
+_DATASET_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _valid_dataset_name(name: str) -> bool:
+    """A dataset name is a single path segment of safe chars — no slashes,
+    no '..', no leading dot-only. Used wherever a name is interpolated into
+    a filesystem path or a Hydra repo_id/root override."""
+    return (isinstance(name, str)
+            and bool(_DATASET_NAME_RE.match(name))
+            and name not in (".", "..")
+            and "/" not in name)
+
+
 def is_inside_root(path: str, root: str) -> bool:
     """True iff realpath(path) is STRICTLY inside realpath(root).
 
@@ -968,6 +1007,10 @@ def scan_datasets(roots: list[str]) -> list[dict]:
                 "name": name,
                 "dsid": dsid_encode(root_index, name),
                 "root": root_r,
+                "path": ds_dir,
+                "category": "current" if root_index == 0 else "legacy",
+                "task": None,
+                "svo_path": None,
                 "total_episodes": None,
                 "total_frames": None,
                 "fps": None,
@@ -977,6 +1020,21 @@ def scan_datasets(roots: list[str]) -> list[dict]:
                 "mtime": None,
                 "error": None,
             }
+            # Canonical task instruction (first tasks.jsonl line) — drives the
+            # Start-panel auto-fill so re-collecting into an existing dataset
+            # reuses the exact task string (avoids a duplicate tasks.jsonl row).
+            try:
+                tasks_path = os.path.join(ds_dir, "meta", "tasks.jsonl")
+                with open(tasks_path) as tf:
+                    first = tf.readline().strip()
+                if first:
+                    entry["task"] = json.loads(first).get("task")
+            except (OSError, ValueError):
+                pass
+            # HD SVO archive sibling (current scheme writes <name>_svo).
+            svo_sib = ds_dir.rstrip("/") + "_svo"
+            if os.path.isdir(svo_sib):
+                entry["svo_path"] = svo_sib
             try:
                 with open(info_path) as f:
                     info = json.load(f)
@@ -1361,6 +1419,13 @@ INDEX_HTML = """<!doctype html>
   .idle { background: #777; }
   button.small { padding: 4px 10px; font-size: 0.85rem; margin: 0 4px 0 0; }
   .notice { font-size: 0.8rem; color: #caa84f; margin: 6px 0; }
+  .path { font-size: 0.72rem; color: #7a7a7a; font-family: monospace;
+          word-break: break-all; }
+  details summary { cursor: pointer; color: #aaa; font-size: 0.9rem;
+          margin: 8px 0; }
+  select, #newDatasetName { width: 100%; box-sizing: border-box;
+          margin-bottom: 6px; }
+  h4 { margin: 6px 0; font-size: 0.95rem; color: #ddd; }
   #playOverlay { display: none; position: fixed; inset: 0; z-index: 20;
          background: rgba(0,0,0,0.85); flex-direction: column;
          align-items: center; justify-content: center; }
@@ -1384,7 +1449,13 @@ INDEX_HTML = """<!doctype html>
     <h3>采集控制</h3>
     <label>Episode 数</label>
     <input type="number" id="numEpisodes" value="10" min="1"/>
-    <label>任务描述</label>
+    <label>数据集 (一个任务一个数据集)</label>
+    <select id="datasetSel" onchange="onDatasetSel()">
+      <option value="__new__">＋ 新建数据集…</option>
+    </select>
+    <input type="text" id="newDatasetName"
+           placeholder="新数据集名 (字母/数字/._-，如 fr3_stackcube_v1)"/>
+    <label>任务描述 (语言指令)</label>
     <input type="text" id="taskDesc" value="pick up the cube"/>
     <div>
       <button class="primary" onclick="startCollect()">Start</button>
@@ -1474,12 +1545,57 @@ async function api(path, body) {
   return j;
 }
 
+// Dataset selector: '__new__' reveals the name input; picking an existing
+// dataset hides it and auto-fills the task instruction from that dataset so a
+// re-collection reuses the exact task string (no duplicate tasks.jsonl row).
+function onDatasetSel() {
+  const sel = document.getElementById('datasetSel');
+  const inp = document.getElementById('newDatasetName');
+  if (sel.value === '__new__') {
+    inp.style.display = '';
+  } else {
+    inp.style.display = 'none';
+    const d = dsCache.find(x => x.category === 'current' && x.name === sel.value);
+    if (d && d.task) document.getElementById('taskDesc').value = d.task;
+  }
+}
+
+function populateDatasetSelector() {
+  const sel = document.getElementById('datasetSel');
+  if (!sel) return;
+  const prev = sel.value;
+  const cur = dsCache.filter(d => d.category === 'current' && !d.error);
+  let html = '<option value="__new__">＋ 新建数据集…</option>';
+  cur.forEach(d => {
+    html += '<option value="' + esc(d.name) + '">' + esc(d.name)
+      + ' (' + (d.total_episodes ?? 0) + ' ep)</option>';
+  });
+  sel.innerHTML = html;
+  // Keep the previous selection if it still exists, else stay on 新建.
+  sel.value = cur.some(d => d.name === prev) ? prev : '__new__';
+  onDatasetSel();
+}
+
+function currentDatasetName() {
+  const sel = document.getElementById('datasetSel');
+  if (sel.value === '__new__') {
+    return document.getElementById('newDatasetName').value.trim();
+  }
+  return sel.value;
+}
+
 async function startCollect() {
   const n = parseInt(document.getElementById('numEpisodes').value, 10);
   const task = document.getElementById('taskDesc').value.trim();
+  const ds = currentDatasetName();
   if (!n || n < 1) { alert('Episode 数必须 >= 1'); return; }
+  if (!ds) { alert('请选择或新建一个数据集'); return; }
+  if (!/^[A-Za-z0-9._-]+$/.test(ds)) {
+    alert('数据集名只能含 字母/数字/._-'); return;
+  }
   if (!task) { alert('任务描述不能为空'); return; }
-  return api('/api/collect/start', {num_episodes: n, task_description: task});
+  return api('/api/collect/start',
+             {num_episodes: n, task_description: task, dataset_name: ds});
 }
 
 async function stopCollect() {
@@ -1661,6 +1777,37 @@ function fmtSize(b) {
   return b + ' B';
 }
 
+function dsRowsHtml(idxList, withRename) {
+  let html = '<table><tr><th>名称</th><th>路径</th><th>episodes</th>'
+    + '<th>frames</th><th>成功率</th><th>大小</th><th>修改时间</th><th></th></tr>';
+  idxList.forEach(i => {
+    const d = dsCache[i];
+    const sr = d.success_rate == null ? '-'
+      : (100 * d.success_rate).toFixed(0) + '% (' + d.n_success + '/'
+        + d.total_episodes + ')';
+    const mt = d.mtime ? new Date(d.mtime * 1000).toLocaleString() : '-';
+    const svo = d.svo_path
+      ? '<div class="path">SVO: ' + esc(d.svo_path) + '</div>' : '';
+    html += '<tr><td>' + esc(d.name)
+      + (d.task ? '<div class="path">task: ' + esc(d.task) + '</div>' : '')
+      + (d.error ? '<div class="err">' + esc(d.error) + '</div>' : '')
+      + '</td>'
+      + '<td><div class="path">' + esc(d.path || '') + '</div>' + svo + '</td>'
+      + '<td>' + (d.total_episodes ?? '-') + '</td>'
+      + '<td>' + (d.total_frames ?? '-') + '</td>'
+      + '<td>' + esc(sr) + '</td>'
+      + '<td>' + fmtSize(d.size_bytes) + '</td>'
+      + '<td>' + esc(mt) + '</td>'
+      + '<td><button class="small" onclick="playEpisode(' + i + ')">回放</button>'
+      + (withRename
+          ? '<button class="small" onclick="renameDataset(' + i + ')">重命名</button>'
+          : '')
+      + '<button class="small danger" onclick="deleteDataset(' + i + ')">删除'
+      + '</button></td></tr>';
+  });
+  return html + '</table>';
+}
+
 function renderDatasets(j) {
   dsCache = j.datasets || [];
   const notice = document.getElementById('dsNotice');
@@ -1671,32 +1818,44 @@ function renderDatasets(j) {
   } else {
     notice.style.display = 'none';
   }
-  if (!dsCache.length) {
-    document.getElementById('dsTable').innerHTML =
-      '无数据集 (roots: ' + esc((j.roots || []).join(', ')) + ')';
-    return;
+  const cur = [], leg = [];
+  dsCache.forEach((d, i) => (d.category === 'current' ? cur : leg).push(i));
+  let html = '<h4 style="margin:6px 0">当前数据集 <span class="path">'
+    + esc((j.roots || [])[0] || '') + '</span></h4>';
+  html += cur.length ? dsRowsHtml(cur, true)
+    : '<div class="path" style="margin-bottom:8px">还没有数据集 — 在上面"采集控制"'
+      + '里新建一个并开始采集</div>';
+  if (leg.length) {
+    html += '<details style="margin-top:12px"><summary>Legacy 旧数据 (旧 scheme / '
+      + '时间戳，' + leg.length + ' 个) <span class="path">'
+      + esc((j.roots || [])[1] || '') + '</span></summary>'
+      + dsRowsHtml(leg, false) + '</details>';
   }
-  let html = '<table><tr><th>名称</th><th>episodes</th><th>frames</th>'
-    + '<th>成功率</th><th>大小</th><th>修改时间</th><th></th></tr>';
-  dsCache.forEach((d, i) => {
-    const sr = d.success_rate == null ? '-'
-      : (100 * d.success_rate).toFixed(0) + '% (' + d.n_success + '/'
-        + d.total_episodes + ')';
-    const mt = d.mtime ? new Date(d.mtime * 1000).toLocaleString() : '-';
-    html += '<tr><td>' + esc(d.name)
-      + (d.error ? '<div class="err">' + esc(d.error) + '</div>' : '')
-      + '</td>'
-      + '<td>' + (d.total_episodes ?? '-') + '</td>'
-      + '<td>' + (d.total_frames ?? '-') + '</td>'
-      + '<td>' + esc(sr) + '</td>'
-      + '<td>' + fmtSize(d.size_bytes) + '</td>'
-      + '<td>' + esc(mt) + '</td>'
-      + '<td><button class="small" onclick="playEpisode(' + i + ')">回放</button>'
-      + '<button class="small danger" onclick="deleteDataset(' + i + ')">删除'
-      + '</button></td></tr>';
-  });
-  html += '</table>';
   document.getElementById('dsTable').innerHTML = html;
+  populateDatasetSelector();
+}
+
+async function renameDataset(i) {
+  const d = dsCache[i];
+  if (!d) return;
+  const nn = prompt('重命名数据集 "' + d.name + '" 为:', d.name);
+  if (nn === null) return;
+  const newName = nn.trim();
+  if (!/^[A-Za-z0-9._-]+$/.test(newName)) {
+    alert('名称只能含 字母/数字/._-'); return;
+  }
+  const el = document.getElementById('dsMsg');
+  try {
+    const r = await fetch('/api/dataset/' + d.dsid + '/rename', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({new_name: newName}),
+    });
+    const jj = await r.json();
+    el.textContent = jj.msg || JSON.stringify(jj);
+  } catch (e) {
+    el.textContent = 'rename error: ' + e;
+  }
+  refreshDatasets();
 }
 
 async function refreshDatasets() {
@@ -1894,7 +2053,12 @@ def build_app(cams: CamManager, mgr: CollectionManager,
         task = str(body.get("task_description", "")).strip()
         if not task:
             return jsonify({"ok": False, "msg": "task_description required"}), 400
-        msg = mgr.start(num_episodes, task)
+        dataset_name = str(body.get("dataset_name", "")).strip() or None
+        if dataset_name is not None and not _valid_dataset_name(dataset_name):
+            return jsonify({"ok": False,
+                            "msg": "invalid dataset name (allowed: letters, "
+                                   "digits, . _ -)"}), 400
+        msg = mgr.start(num_episodes, task, dataset_name)
         code = 409 if msg.startswith("refused") else 200
         return jsonify({"ok": code == 200, "msg": msg}), code
 
@@ -2156,8 +2320,63 @@ def build_app(cams: CamManager, mgr: CollectionManager,
         except Exception as e:
             return jsonify({"ok": False,
                             "msg": f"delete failed: {e!r}"[:300]}), 500
-        _log.info(f"dataset deleted: {ds_dir}")
-        return jsonify({"ok": True, "msg": f"deleted {dsid_decode(dsid)[1]}"})
+        # Also remove the HD SVO archive sibling (current scheme), guarded the
+        # same way so we never rmtree outside a dataset root.
+        svo_sib = ds_dir.rstrip("/") + "_svo"
+        svo_msg = ""
+        if (os.path.isdir(svo_sib)
+                and any(is_inside_root(svo_sib, r) for r in dataset_roots)):
+            try:
+                shutil.rmtree(svo_sib)
+                svo_msg = " + svo"
+            except Exception as e:
+                svo_msg = f" (svo delete failed: {e!r})"[:80]
+        _log.info(f"dataset deleted: {ds_dir}{svo_msg}")
+        return jsonify({"ok": True,
+                        "msg": f"deleted {dsid_decode(dsid)[1]}{svo_msg}"})
+
+    @app.post("/api/dataset/<dsid>/rename")
+    def api_dataset_rename(dsid):
+        if mgr.is_collecting():
+            return jsonify({"ok": False,
+                            "msg": "refused: collection running"}), 409
+        body = request.get_json(silent=True) or {}
+        new_name = str(body.get("new_name", "")).strip()
+        if not _valid_dataset_name(new_name):
+            return jsonify({"ok": False,
+                            "msg": "invalid new name (allowed: letters, "
+                                   "digits, . _ -)"}), 400
+        ds_dir = _resolve_dataset(dsid, dataset_roots)
+        if ds_dir is None:
+            return jsonify({"ok": False, "msg": "dataset not found"}), 404
+        parent = os.path.dirname(ds_dir)
+        dst = os.path.join(parent, new_name)
+        # dst must land strictly inside a configured root, and not already exist.
+        if not any(is_inside_root(dst, r) for r in dataset_roots):
+            return jsonify({"ok": False,
+                            "msg": "refused: target escapes dataset roots"}), 403
+        if os.path.exists(dst):
+            return jsonify({"ok": False,
+                            "msg": f"refused: {new_name} already exists"}), 409
+        try:
+            os.rename(ds_dir, dst)
+        except Exception as e:
+            return jsonify({"ok": False,
+                            "msg": f"rename failed: {e!r}"[:300]}), 500
+        # Rename the HD SVO sibling too, best-effort (keeps name↔svo in sync).
+        svo_src = ds_dir.rstrip("/") + "_svo"
+        svo_msg = ""
+        if os.path.isdir(svo_src):
+            svo_dst = dst.rstrip("/") + "_svo"
+            if (any(is_inside_root(svo_dst, r) for r in dataset_roots)
+                    and not os.path.exists(svo_dst)):
+                try:
+                    os.rename(svo_src, svo_dst)
+                    svo_msg = " + svo"
+                except Exception as e:
+                    svo_msg = f" (svo rename failed: {e!r})"[:80]
+        _log.info(f"dataset renamed: {ds_dir} -> {dst}{svo_msg}")
+        return jsonify({"ok": True, "msg": f"renamed -> {new_name}{svo_msg}"})
 
     return app
 
