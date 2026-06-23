@@ -40,11 +40,35 @@ def _ce(tmp_path):
 def test_success_renames_svo_to_episode_index(tmp_path):
     ce, svo_dir = _ce(tmp_path)
     ce.reset()
-    ce._finalize_svo(env_idx=0, kept=True)
+    ce._finalize_svo(env_idx=0, kept=True, episode_index=0)
     files = set(os.listdir(svo_dir))
-    assert {"episode_0_wrist_1.svo2", "episode_0_wrist_2.svo2"}.issubset(files)
+    assert {
+        "episode_000000_wrist_1.svo2",
+        "episode_000000_wrist_2.svo2",
+    }.issubset(files)
     idx = json.load(open(os.path.join(svo_dir, "svo_index.json")))
     assert "0" in idx and len(idx["0"]) == 2
+    assert set(idx["0"]) == {
+        "episode_000000_wrist_1.svo2",
+        "episode_000000_wrist_2.svo2",
+    }
+
+
+def test_success_renames_svo_with_nonzero_index(tmp_path):
+    ce, svo_dir = _ce(tmp_path)
+    ce.reset()
+    ce._finalize_svo(env_idx=0, kept=True, episode_index=7)
+    files = set(os.listdir(svo_dir))
+    assert {
+        "episode_000007_wrist_1.svo2",
+        "episode_000007_wrist_2.svo2",
+    }.issubset(files)
+    idx = json.load(open(os.path.join(svo_dir, "svo_index.json")))
+    assert "7" in idx and len(idx["7"]) == 2
+    assert set(idx["7"]) == {
+        "episode_000007_wrist_1.svo2",
+        "episode_000007_wrist_2.svo2",
+    }
 
 
 def test_discard_deletes_svo(tmp_path):
