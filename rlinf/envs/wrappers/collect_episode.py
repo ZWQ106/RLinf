@@ -112,13 +112,18 @@ class CollectEpisode(gym.Wrapper):
         else:
             self._svo_dir = os.path.join(os.path.dirname(save_dir.rstrip("/")), "svo")
         self._svo_active: dict[str, str] = {}
-        self._svo_kept = 0
 
         # LeRobot writer is created lazily on the first completed episode.
         if export_format == "lerobot":
             self._lerobot_writer: Optional[Any] = None
             self._lerobot_lock = Lock()
             self._episodes_written = 0  # guarded by _lerobot_lock
+            # Synchronous count of episodes handed to the (async) LeRobot writer.
+            # The parquet episode_index of the Nth submitted episode equals the
+            # value of this counter *before* its increment, so capturing it at
+            # submit time lets the SVO be named by the same index. Guarded by
+            # _lerobot_lock so it stays consistent with _episodes_written.
+            self._lerobot_submitted = 0
 
         # Single-worker executor keeps write ordering deterministic.
         self._executor: Optional[ThreadPoolExecutor] = ThreadPoolExecutor(
@@ -356,8 +361,10 @@ class CollectEpisode(gym.Wrapper):
             done_by_trunc = self._scalar_flag(truncated, env_idx)
             if self.only_success:
                 if is_success and done_by_term:
-                    self._flush_episode(env_idx, is_success)
-                    self._finalize_svo(env_idx, kept=True)
+                    episode_index = self._flush_episode(env_idx, is_success)
+                    self._finalize_svo(
+                        env_idx, kept=True, episode_index=episode_index
+                    )
                     self._reset_env_buffer(env_idx)
                 else:
                     if done_by_trunc:
@@ -372,8 +379,10 @@ class CollectEpisode(gym.Wrapper):
                         self._finalize_svo(env_idx, kept=False)
             else:
                 if done_by_term or done_by_trunc:
-                    self._flush_episode(env_idx, is_success)
-                    self._finalize_svo(env_idx, kept=is_success)
+                    episode_index = self._flush_episode(env_idx, is_success)
+                    self._finalize_svo(
+                        env_idx, kept=is_success, episode_index=episode_index
+                    )
                     self._reset_env_buffer(env_idx)
 
     def _start_svo(self) -> None:
@@ -401,7 +410,9 @@ class CollectEpisode(gym.Wrapper):
             )
             self._svo_active = {}
 
-    def _finalize_svo(self, env_idx: int, kept: bool) -> None:
+    def _finalize_svo(
+        self, env_idx: int, kept: bool, episode_index: Optional[int] = None
+    ) -> None:
         if not self.record_svo:
             return
         try:
@@ -415,16 +426,17 @@ class CollectEpisode(gym.Wrapper):
         # rename/index hiccup must NOT propagate into _maybe_flush and kill the
         # collection loop. Log and swallow.
         try:
-            if not kept:
+            if not kept or episode_index is None:
                 for p in active.values():
                     if os.path.exists(p):
                         os.remove(p)
                 return
-            idx = self._svo_kept
-            self._svo_kept += 1
+            idx = episode_index
             kept_files = []
             for name, temp in active.items():
-                dst = os.path.join(self._svo_dir, f"episode_{idx}_{name}.svo2")
+                dst = os.path.join(
+                    self._svo_dir, f"episode_{idx:06d}_{name}.svo2"
+                )
                 if os.path.exists(temp):
                     os.replace(temp, dst)
                     kept_files.append(os.path.basename(dst))
@@ -439,17 +451,32 @@ class CollectEpisode(gym.Wrapper):
         except Exception as e:
             self.logger.warning(f"SVO finalize failed (LeRobot episode already saved): {e}")
 
-    def _flush_episode(self, env_idx: int, is_success: bool) -> None:
-        """Dispatch a completed episode to the appropriate format writer."""
+    def _flush_episode(self, env_idx: int, is_success: bool) -> Optional[int]:
+        """Dispatch a completed episode to the appropriate format writer.
+
+        For the LeRobot format, returns the parquet ``episode_index`` that this
+        episode will be assigned (so the SVO can be named with the same index),
+        or ``None`` if nothing was submitted to the writer.
+        """
         self.logger.info(f"Flush env {env_idx}")
         buf = self._buffers[env_idx]
         if not buf["actions"]:
-            return
+            return None
 
         if self.export_format == "lerobot":
             ep_data = self._buffer_to_lerobot_ep(buf, env_idx, is_success)
-            if ep_data is not None:
-                self._submit(self._write_lerobot_episode, ep_data)
+            if ep_data is None:
+                return None
+            # The writer assigns episodes sequentially in submit order via a
+            # single-worker executor, so the index of this episode equals the
+            # number of episodes submitted before it. Capture (and reserve) it
+            # synchronously under the lock; _episodes_written is bumped later on
+            # the writer thread and will converge to the same value.
+            with self._lerobot_lock:
+                episode_index = self._lerobot_submitted
+                self._lerobot_submitted += 1
+            self._submit(self._write_lerobot_episode, ep_data)
+            return episode_index
         else:
             episode_data = self._copy(
                 {
