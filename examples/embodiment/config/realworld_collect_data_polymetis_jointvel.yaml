@@ -65,6 +65,7 @@ env:
       task_description: "pick up the cube"
       target_ee_pose: [0.5, 0.0, 0.1, -3.14, 0.0, 0.0]
       success_hold_steps: 1
+      obs_image_size: 224
 
     data_collection:
       enabled: True
@@ -74,3 +75,7 @@ env:
       robot_type: "panda"
       fps: 15
       record_svo: True
+      repo_id: "tasl/fr3_pickcube_v1"
+      root: "/home/franka_desktop/work/datasets/fr3_pickcube_v1"
+      svo_dir: "/home/franka_desktop/work/datasets/fr3_pickcube_v1_svo"
+      save_pt_trajectory: False
