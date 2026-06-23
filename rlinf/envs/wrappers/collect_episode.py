@@ -117,13 +117,17 @@ class CollectEpisode(gym.Wrapper):
         if export_format == "lerobot":
             self._lerobot_writer: Optional[Any] = None
             self._lerobot_lock = Lock()
-            self._episodes_written = 0  # guarded by _lerobot_lock
+            # Seed from any dataset already on disk so cross-session accumulation
+            # (fixed repo_id + root via open_or_create) names the SVO by the same
+            # episode_index LeRobot will assign to the next parquet.
+            seed = self._existing_total_episodes(root)
+            self._episodes_written = seed  # guarded by _lerobot_lock
             # Synchronous count of episodes handed to the (async) LeRobot writer.
             # The parquet episode_index of the Nth submitted episode equals the
             # value of this counter *before* its increment, so capturing it at
             # submit time lets the SVO be named by the same index. Guarded by
             # _lerobot_lock so it stays consistent with _episodes_written.
-            self._lerobot_submitted = 0
+            self._lerobot_submitted = seed
 
         # Single-worker executor keeps write ordering deterministic.
         self._executor: Optional[ThreadPoolExecutor] = ThreadPoolExecutor(
@@ -148,6 +152,22 @@ class CollectEpisode(gym.Wrapper):
 
         os.makedirs(self.save_dir, exist_ok=True)
         atexit.register(self._finalize_on_exit)
+
+    @staticmethod
+    def _existing_total_episodes(root: Optional[str]) -> int:
+        """Episodes already present in the LeRobot dataset at `root` (0 if none).
+
+        Used to seed the episode counters so cross-session accumulation names SVO
+        by the same episode_index LeRobot will assign to the parquet.
+        """
+        if not root:
+            return 0
+        info_path = os.path.join(root, "meta", "info.json")
+        try:
+            with open(info_path) as f:
+                return int(json.load(f).get("total_episodes", 0))
+        except (OSError, ValueError, KeyError):
+            return 0
 
     @property
     def is_start(self):
