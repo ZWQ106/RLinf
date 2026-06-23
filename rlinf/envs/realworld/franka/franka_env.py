@@ -57,8 +57,12 @@ class FrankaRobotConfig:
     # Example: {"230322271990": [0.0, 0.15, 1.0, 0.85]}
     camera_crop_regions: Optional[dict[str, list[float]]] = None
     # ZED capture resolution [width, height], e.g. [1920, 1080] for HD1080.
-    # None -> CameraInfo default (VGA). Independent of the obs reshape (128).
+    # None -> CameraInfo default (VGA). Independent of the obs reshape size.
     camera_resolution: Optional[list[int]] = None
+    # Square H/W of the observation/training frames after crop+resize.
+    # pi0/pi05 resize to 224 internally; 224 is the no-loss/no-waste default.
+    # Default 128 preserves the existing eval-path behavior.
+    obs_image_size: int = 128
 
     is_dummy: bool = False
     use_dense_reward: bool = False
@@ -170,6 +174,9 @@ class FrankaEnv(gym.Env):
             self.config.gripper_type,
         ).value
         self._task_description = config.task_description
+        # pi0/pi05 resize to 224 internally; 224 is the no-loss/no-waste default.
+        # Configurable; default 128 preserves the existing eval-path behavior.
+        self._obs_image_size = int(getattr(config, "obs_image_size", 128))
         self.hardware_info = hardware_info
         self.env_idx = env_idx
         self.node_rank = 0
@@ -623,7 +630,10 @@ class FrankaEnv(gym.Env):
                 "frames": gym.spaces.Dict(
                     {
                         camera_info.name: gym.spaces.Box(
-                            0, 255, shape=(128, 128, 3), dtype=np.uint8
+                            0,
+                            255,
+                            shape=(self._obs_image_size, self._obs_image_size, 3),
+                            dtype=np.uint8,
                         )
                         for camera_info in self._camera_infos
                     }
