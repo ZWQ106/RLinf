@@ -71,6 +71,9 @@ class DataCollector(Worker):
                 record_svo=getattr(
                     self.cfg.env.eval.data_collection, "record_svo", False
                 ),
+                repo_id=getattr(self.cfg.env.eval.data_collection, "repo_id", None),
+                root=getattr(self.cfg.env.eval.data_collection, "root", None),
+                svo_dir=getattr(self.cfg.env.eval.data_collection, "svo_dir", None),
             )
 
         # Read from the wrapped action space so GripperCloseEnv / dual-arm all just work.
@@ -79,10 +82,12 @@ class DataCollector(Worker):
         buffer_path = os.path.join(self.cfg.runner.logger.log_path, "demos")
         self.log_info(f"Initializing ReplayBuffer at: {buffer_path}")
 
+        dc = self.cfg.env.eval.get("data_collection", None)
+        save_pt = bool(getattr(dc, "save_pt_trajectory", False)) if dc else False
         self.buffer = TrajectoryReplayBuffer(
             seed=self.cfg.seed if hasattr(self.cfg, "seed") else 1234,
             enable_cache=False,
-            auto_save=True,
+            auto_save=save_pt,
             auto_save_path=buffer_path,
             trajectory_format="pt",
         )
