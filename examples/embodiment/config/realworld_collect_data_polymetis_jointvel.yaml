@@ -76,6 +76,9 @@ env:
       fps: 15
       record_svo: True
       repo_id: "tasl/fr3_pickcube_v1"
-      root: "/home/franka_desktop/work/datasets/fr3_pickcube_v1"
-      svo_dir: "/home/franka_desktop/work/datasets/fr3_pickcube_v1_svo"
+      # Container-internal paths: /workspace/rlinf is the only writable host mount
+      # (-> host ~/work/rlinf-clone). A host path like ~/work/datasets would land
+      # in the container's ephemeral overlay and be lost on restart / invisible to host.
+      root: "/workspace/rlinf/datasets/fr3_pickcube_v1"
+      svo_dir: "/workspace/rlinf/datasets/fr3_pickcube_v1_svo"
       save_pt_trajectory: False
