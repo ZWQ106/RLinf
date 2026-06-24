@@ -21,3 +21,6 @@ rlinf/envs/maniskill/assets
 PKG-INFO
 *.egg-info/
 .claude/settings.json
+
+# Collected LeRobot datasets + SVO archives (data, never commit)
+datasets/
