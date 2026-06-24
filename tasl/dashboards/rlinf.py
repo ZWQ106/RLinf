@@ -299,6 +299,10 @@ class EvalRunner:
                 f"cd {container_repo} && "
                 f"PATH=/opt/venv/openpi/bin:$PATH "
                 f"PYTHONPATH={container_repo} "
+                # The eval config's hydra searchpath is
+                # file://${oc.env:EMBODIED_PATH}/config/ — without this the run
+                # dies at startup with "Environment variable 'EMBODIED_PATH' not found".
+                f"EMBODIED_PATH={container_repo}/examples/embodiment "
                 f"/opt/venv/openpi/bin/python "
                 f"{container_repo}/examples/embodiment/eval_embodied_agent.py "
                 f"--config-path={container_repo}/examples/embodiment/config/ "
