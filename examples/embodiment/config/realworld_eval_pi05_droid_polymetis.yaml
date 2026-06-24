@@ -156,12 +156,12 @@ env:
     stop_chunk_on_done: True
     main_image_key: wrist_1
     total_num_envs: 1
-    max_steps_per_rollout_epoch: 200   # must be divisible by num_action_chunks (8)
-    max_episode_steps: 200
+    max_steps_per_rollout_epoch: 600   # must be divisible by num_action_chunks (8); 600 steps ~65s
+    max_episode_steps: 600
     use_gello: False
     override_cfg:
       task_description: "grasp"
-      max_num_steps: 300
+      max_num_steps: 600
     data_collection:
       enabled: True
       save_dir: "/tmp/rlinf_pi05_droid_eval"
