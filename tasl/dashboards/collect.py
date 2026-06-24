@@ -1104,6 +1104,169 @@ def legacy_datasets_in_container() -> Optional[bool]:
     return r.returncode == 0
 
 
+def list_episodes_meta(ds_dir: str) -> list[dict]:
+    """Per-episode rows for the expandable dataset view: {index, task,
+    length, success}. Cheap (reads only meta JSONL, no parquet)."""
+    succ: dict[int, Optional[bool]] = {}
+    spath = os.path.join(ds_dir, "meta", "episodes_stats.jsonl")
+    if os.path.isfile(spath):
+        try:
+            with open(spath) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    d = json.loads(line)
+                    ei = d.get("episode_index")
+                    s = (d.get("stats") or {}).get("is_success") or {}
+                    mx = s.get("max")
+                    if isinstance(mx, list):
+                        mx = mx[0] if mx else None
+                    if ei is not None:
+                        succ[ei] = bool(mx) if mx is not None else None
+        except (OSError, ValueError):
+            pass
+    eps: list[dict] = []
+    epath = os.path.join(ds_dir, "meta", "episodes.jsonl")
+    if os.path.isfile(epath):
+        try:
+            with open(epath) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    d = json.loads(line)
+                    ei = d.get("episode_index")
+                    tasks = d.get("tasks") or []
+                    eps.append({"index": ei,
+                                "task": tasks[0] if tasks else None,
+                                "length": d.get("length"),
+                                "success": succ.get(ei)})
+        except (OSError, ValueError):
+            pass
+    return eps
+
+
+def _svo_files_for(svo_dir: str, ep: int) -> list[str]:
+    return sorted(glob.glob(os.path.join(glob.escape(svo_dir),
+                                         f"episode_{ep:06d}_*.svo2")))
+
+
+def delete_episode(ds_dir: str, ep: int) -> str:
+    """Delete ONE episode from a LeRobot v2.1 dataset and re-index the rest so
+    episode_index stays contiguous (0..N-2).
+
+    Per later episode j>ep: rewrite its parquet (episode_index -> j-1, global
+    `index` -= removed-length), move episode_j -> episode_{j-1}, rename its SVO
+    sibling, then rebuild episodes.jsonl / episodes_stats.jsonl / info.json /
+    svo_index.json. Requires pyarrow. Returns a status string (a 'refused: ' /
+    'error: ' prefix on failure). NOTE: assumes a single chunk (<chunks_size
+    episodes), which always holds for this bench's datasets."""
+    if not HAS_PYARROW:
+        return "error: pyarrow not installed on this host"
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    info_path = os.path.join(ds_dir, "meta", "info.json")
+    try:
+        with open(info_path) as f:
+            info = json.load(f)
+    except Exception as e:
+        return f"error: info.json unreadable: {e!r}"[:200]
+    total = int(info.get("total_episodes") or 0)
+    if not 0 <= ep < total:
+        return f"refused: episode {ep} out of range (0..{total - 1})"
+    chunks_size = int(info.get("chunks_size") or 1000)
+    if total > chunks_size:
+        return ("refused: multi-chunk dataset (>{} episodes) — per-episode "
+                "delete not supported".format(chunks_size))
+    eps_path = os.path.join(ds_dir, "meta", "episodes.jsonl")
+    try:
+        eps = [json.loads(l) for l in open(eps_path) if l.strip()]
+    except Exception as e:
+        return f"error: episodes.jsonl unreadable: {e!r}"[:200]
+    len_ep = int((eps[ep] if ep < len(eps) else {}).get("length") or 0)
+    svo_dir = ds_dir.rstrip("/") + "_svo"
+
+    def pq_path(i: int) -> str:
+        return _episode_parquet_path(ds_dir, info, i)
+
+    try:
+        # 1. drop the target episode's parquet + SVO
+        p = pq_path(ep)
+        if os.path.isfile(p):
+            os.remove(p)
+        for s in _svo_files_for(svo_dir, ep):
+            try:
+                os.remove(s)
+            except OSError:
+                pass
+        # 2. shift every later episode down by one
+        for j in range(ep + 1, total):
+            src, dst = pq_path(j), pq_path(j - 1)
+            if os.path.isfile(src):
+                t = pq.read_table(src)
+                n = t.num_rows
+                ei_i = t.schema.get_field_index("episode_index")
+                ix_i = t.schema.get_field_index("index")
+                t = t.set_column(ei_i, "episode_index",
+                                 pa.array([j - 1] * n,
+                                          type=t.schema.field(ei_i).type))
+                shifted = [x - len_ep for x in t.column("index").to_pylist()]
+                t = t.set_column(ix_i, "index",
+                                 pa.array(shifted,
+                                          type=t.schema.field(ix_i).type))
+                pq.write_table(t, dst)
+                os.remove(src)
+            for s in _svo_files_for(svo_dir, j):
+                cam = os.path.basename(s)[len(f"episode_{j:06d}_"):]
+                os.rename(s, os.path.join(svo_dir,
+                                          f"episode_{j - 1:06d}_{cam}"))
+        # 3. episodes.jsonl + episodes_stats.jsonl (drop ep, renumber > ep)
+        for meta_name in ("episodes.jsonl", "episodes_stats.jsonl"):
+            mp = os.path.join(ds_dir, "meta", meta_name)
+            if not os.path.isfile(mp):
+                continue
+            rows = [json.loads(l) for l in open(mp) if l.strip()]
+            out = []
+            for d in rows:
+                ei = d.get("episode_index")
+                if ei == ep:
+                    continue
+                if isinstance(ei, int) and ei > ep:
+                    d["episode_index"] = ei - 1
+                out.append(d)
+            with open(mp, "w") as f:
+                for d in out:
+                    f.write(json.dumps(d) + "\n")
+        # 4. info.json counters
+        info["total_episodes"] = total - 1
+        info["total_frames"] = int(info.get("total_frames") or 0) - len_ep
+        info["splits"] = {"train": f"0:{total - 1}"}
+        with open(info_path, "w") as f:
+            json.dump(info, f, indent=4)
+        # 5. svo_index.json (renumber keys + filenames)
+        sidx_path = os.path.join(svo_dir, "svo_index.json")
+        if os.path.isfile(sidx_path):
+            try:
+                sidx = json.load(open(sidx_path))
+                new_sidx = {}
+                for k, v in sidx.items():
+                    ki = int(k)
+                    if ki == ep:
+                        continue
+                    nk = ki - 1 if ki > ep else ki
+                    new_sidx[str(nk)] = [
+                        fn.replace(f"episode_{ki:06d}_", f"episode_{nk:06d}_")
+                        for fn in v]
+                with open(sidx_path, "w") as f:
+                    json.dump(new_sidx, f, indent=2)
+            except (OSError, ValueError):
+                pass
+    except Exception as e:
+        return f"error: delete failed mid-way: {e!r}"[:250]
+    return f"deleted episode {ep}; {total - 1} remain"
+
+
 def _decode_image_cell(cell) -> Optional["object"]:
     """LeRobot v2.1 image cell -> BGR ndarray. Cell is the HF image
     struct {bytes, path} (verified: PNG bytes embedded per row); plain
@@ -1426,6 +1589,9 @@ INDEX_HTML = """<!doctype html>
   select, #newDatasetName { width: 100%; box-sizing: border-box;
           margin-bottom: 6px; }
   h4 { margin: 6px 0; font-size: 0.95rem; color: #ddd; }
+  .epbox { padding: 6px 10px; background: #161616; border-left: 2px solid #3a6;
+           margin: 2px 0 6px 0; }
+  .epbox table { width: auto; } .epbox th, .epbox td { padding: 3px 10px; }
   #playOverlay { display: none; position: fixed; inset: 0; z-index: 20;
          background: rgba(0,0,0,0.85); flex-direction: column;
          align-items: center; justify-content: center; }
@@ -1798,12 +1964,15 @@ function dsRowsHtml(idxList, withRename) {
       + '<td>' + esc(sr) + '</td>'
       + '<td>' + fmtSize(d.size_bytes) + '</td>'
       + '<td>' + esc(mt) + '</td>'
-      + '<td><button class="small" onclick="playEpisode(' + i + ')">回放</button>'
+      + '<td><button class="small" onclick="toggleEpisodes(' + i + ')">'
+      + '<span id="dsx-' + i + '">▶</span> 展开</button>'
       + (withRename
           ? '<button class="small" onclick="renameDataset(' + i + ')">重命名</button>'
           : '')
       + '<button class="small danger" onclick="deleteDataset(' + i + ')">删除'
       + '</button></td></tr>';
+    html += '<tr id="dsd-' + i + '" style="display:none"><td colspan="8">'
+      + '<div id="dsdc-' + i + '" class="epbox">展开中…</div></td></tr>';
   });
   return html + '</table>';
 }
@@ -1903,6 +2072,72 @@ async function deleteDataset(i) {
     el.textContent = j.msg || JSON.stringify(j);
   } catch (e) {
     el.textContent = 'delete error: ' + e;
+  }
+  refreshDatasets();
+}
+
+async function toggleEpisodes(i) {
+  const d = dsCache[i];
+  const row = document.getElementById('dsd-' + i);
+  const arrow = document.getElementById('dsx-' + i);
+  const box = document.getElementById('dsdc-' + i);
+  if (!d || !row) return;
+  if (row.style.display !== 'none') {
+    row.style.display = 'none'; arrow.textContent = '▶'; return;
+  }
+  row.style.display = ''; arrow.textContent = '▼';
+  box.textContent = '展开中…';
+  try {
+    const r = await fetch('/api/dataset/' + d.dsid + '/episodes');
+    const j = await r.json();
+    renderEpisodes(i, j.episodes || []);
+  } catch (e) {
+    box.textContent = 'episode 加载失败: ' + e;
+  }
+}
+
+function renderEpisodes(i, eps) {
+  const box = document.getElementById('dsdc-' + i);
+  if (!eps.length) { box.textContent = '无 episode'; return; }
+  let h = '<table><tr><th>episode</th><th>task</th><th>frames</th>'
+    + '<th>成功</th><th></th></tr>';
+  eps.forEach(e => {
+    const su = e.success == null ? '-' : (e.success ? '✅' : '❌');
+    h += '<tr><td>' + e.index + '</td>'
+      + '<td>' + esc(e.task || '-') + '</td>'
+      + '<td>' + (e.length ?? '-') + '</td>'
+      + '<td>' + su + '</td>'
+      + '<td><button class="small" onclick="playEpisodeIdx(' + i + ',' + e.index
+      + ')">回放</button>'
+      + '<button class="small danger" onclick="deleteEpisode(' + i + ',' + e.index
+      + ')">删除</button></td></tr>';
+  });
+  box.innerHTML = h + '</table>';
+}
+
+function playEpisodeIdx(i, ep) {
+  const d = dsCache[i];
+  if (!d) return;
+  document.getElementById('playTitle').textContent =
+    d.name + ' / episode ' + ep + ' (播完即止)';
+  document.getElementById('playImg').src =
+    '/api/dataset/' + d.dsid + '/episode/' + ep + '/play.mjpg?ts=' + Date.now();
+  document.getElementById('playOverlay').style.display = 'flex';
+}
+
+async function deleteEpisode(i, ep) {
+  const d = dsCache[i];
+  if (!d) return;
+  if (!confirm('删除 ' + d.name + ' 的 episode ' + ep
+      + ' ？\n后面的 episode 会自动重新编号 (episode_index 保持连续)。')) return;
+  const el = document.getElementById('dsMsg');
+  try {
+    const r = await fetch('/api/dataset/' + d.dsid + '/episode/' + ep
+      + '?confirm=yes', {method: 'DELETE'});
+    const j = await r.json();
+    el.textContent = j.msg || JSON.stringify(j);
+  } catch (e) {
+    el.textContent = 'episode delete error: ' + e;
   }
   refreshDatasets();
 }
@@ -2298,6 +2533,31 @@ def build_app(cams: CamManager, mgr: CollectionManager,
 
         return Response(gen(),
                         mimetype="multipart/x-mixed-replace; boundary=frame")
+
+    @app.get("/api/dataset/<dsid>/episodes")
+    def api_dataset_episodes(dsid):
+        ds_dir = _resolve_dataset(dsid, dataset_roots)
+        if ds_dir is None:
+            return jsonify({"ok": False, "msg": "dataset not found"}), 404
+        return jsonify({"ok": True, "episodes": list_episodes_meta(ds_dir)})
+
+    @app.route("/api/dataset/<dsid>/episode/<int:n>", methods=["DELETE"])
+    def api_dataset_episode_delete(dsid, n):
+        if request.args.get("confirm") != "yes":
+            return jsonify({"ok": False,
+                            "msg": "refused: requires ?confirm=yes"}), 400
+        if mgr.is_collecting():
+            return jsonify({"ok": False,
+                            "msg": "refused: collection running"}), 409
+        ds_dir = _resolve_dataset(dsid, dataset_roots)
+        if ds_dir is None:
+            return jsonify({"ok": False, "msg": "dataset not found"}), 404
+        msg = delete_episode(ds_dir, int(n))
+        if msg.startswith("deleted"):
+            _log.info(f"episode delete: {ds_dir} ep={n} -> {msg}")
+            return jsonify({"ok": True, "msg": msg}), 200
+        code = 409 if msg.startswith("refused") else 500
+        return jsonify({"ok": False, "msg": msg}), code
 
     @app.route("/api/dataset/<dsid>", methods=["DELETE"])
     def api_dataset_delete(dsid):
