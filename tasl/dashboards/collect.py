@@ -2129,7 +2129,7 @@ async function deleteEpisode(i, ep) {
   const d = dsCache[i];
   if (!d) return;
   if (!confirm('删除 ' + d.name + ' 的 episode ' + ep
-      + ' ？\n后面的 episode 会自动重新编号 (episode_index 保持连续)。')) return;
+      + ' ？后面的 episode 会自动重新编号 (episode_index 保持连续)。')) return;
   const el = document.getElementById('dsMsg');
   try {
     const r = await fetch('/api/dataset/' + d.dsid + '/episode/' + ep
