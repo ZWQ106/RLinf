@@ -1,0 +1,72 @@
+# Derivative of ghcr.io/droid-dataset/droid_nuc:fr3 — bumps libfranka
+# from 0.13.5 to 0.18.1 so the polymetis franka_panda_client speaks the
+# FR3 fw 5.9.2 server protocol (v10). Polymetis cpp source is unchanged —
+# franka_panda_client.cpp uses only APIs preserved across 0.13 -> 0.18.
+FROM ghcr.io/droid-dataset/droid_nuc:fr3
+
+ARG LIBFRANKA_VERSION=0.18.1
+
+# Defensive: install the libfranka build deps that 0.13.5 didn't need but
+# 0.18.x does (Pinocchio kinematics, tinyxml2 cmake config, urdfdom, etc.).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential cmake git pkg-config \
+        libpoco-dev libeigen3-dev libfmt-dev libspdlog-dev \
+        libconsole-bridge-dev liburdfdom-dev liburdfdom-headers-dev \
+        libtinyxml2-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# tinyxml2 CONFIG-mode shim (Ubuntu 20.04 ships lib but no cmake config;
+# pinocchio CONFIG-mode find_package() needs one).
+RUN mkdir -p /usr/lib/x86_64-linux-gnu/cmake/tinyxml2 && \
+    printf '%s\n' \
+        'if(NOT TARGET tinyxml2::tinyxml2)' \
+        '  add_library(tinyxml2::tinyxml2 SHARED IMPORTED)' \
+        '  set_target_properties(tinyxml2::tinyxml2 PROPERTIES' \
+        '    IMPORTED_LOCATION "/usr/lib/x86_64-linux-gnu/libtinyxml2.so"' \
+        '    INTERFACE_INCLUDE_DIRECTORIES "/usr/include")' \
+        'endif()' \
+        'set(tinyxml2_VERSION "7.0.0")' \
+        'set(tinyxml2_LIBRARIES tinyxml2::tinyxml2)' \
+        > /usr/lib/x86_64-linux-gnu/cmake/tinyxml2/tinyxml2-config.cmake
+
+# Replace libfranka 0.13.5 with the requested version.
+WORKDIR /app/droid/fairo/polymetis/polymetis/src/clients/franka_panda_client/third_party
+RUN rm -rf libfranka && \
+    git clone --recursive -b ${LIBFRANKA_VERSION} \
+        https://github.com/frankaemika/libfranka.git libfranka
+
+# Patch + build libfranka.
+# Pinocchio 3.0 renamed `Frame::parent` -> `Frame::parentJoint` (same field,
+# different name). The droid_nuc image ships Pinocchio 2.x, so libfranka 0.18
+# fails to compile robot_model.cpp. Patch back to the 2.x name.
+WORKDIR /app/droid/fairo/polymetis/polymetis/src/clients/franka_panda_client/third_party/libfranka
+RUN find . -name CMakeLists.txt -exec \
+        sed -i 's/cmake_minimum_required(VERSION [0-9.]*)/cmake_minimum_required(VERSION 3.5)/' {} \; && \
+    sed -i 's/\.parentJoint/\.parent/g' src/robot_model.cpp && \
+    grep -n parentJoint src/robot_model.cpp || true && \
+    mkdir build && cd build && \
+    cmake .. \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_CXX_STANDARD=17 \
+        -DBUILD_TESTS=OFF -DBUILD_EXAMPLES=OFF \
+        -DCMAKE_POLICY_VERSION_MINIMUM=3.5 && \
+    make -j$(nproc)
+
+# Rebuild polymetis franka_panda_client target to link the new libfranka.
+# libfranka 0.18 headers use std::optional (C++17); polymetis was originally
+# configured with C++14. Wipe cmake cache + force C++17.
+WORKDIR /app/droid/fairo/polymetis/polymetis/build
+RUN bash -lc "source /root/miniconda3/etc/profile.d/conda.sh && \
+              conda activate polymetis-local && \
+              export CONDA_LIB=/root/miniconda3/envs/polymetis-local/lib && \
+              export LDFLAGS=\"-L\${CONDA_LIB} -Wl,-rpath=\${CONDA_LIB} \${LDFLAGS}\" && \
+              export LD_LIBRARY_PATH=\${CONDA_LIB}:\${LD_LIBRARY_PATH} && \
+              rm -rf CMakeCache.txt CMakeFiles franka_panda_client && \
+              cmake .. -DCMAKE_CXX_STANDARD=17 -DCMAKE_CXX_STANDARD_REQUIRED=ON -DBUILD_FRANKA=ON \
+                       -DCMAKE_BUILD_RPATH=\${CONDA_LIB} \
+                       -DCMAKE_INSTALL_RPATH=\${CONDA_LIB} && \
+              make -j\$(nproc) franka_panda_client && \
+              ldd ./franka_panda_client | grep franka"
+
+# Image label so we can tell at a glance which libfranka is inside.
+LABEL libfranka.version=${LIBFRANKA_VERSION}

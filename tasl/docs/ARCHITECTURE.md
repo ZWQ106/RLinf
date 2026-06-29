@@ -35,7 +35,7 @@ robot/camera/policy logic itself.
 | **RLinf** | `~/RLinf`, `~/work/rlinf-clone` | Embodied RL/data framework: `collect_real_data.py`, `eval_embodied_agent.py`, `rlinf/envs/realworld/franka/*` (env, polymetis controller, GELLO teleop), configs. Runs in the `rlinf-eval` container. | Python + Ray; `examples/embodiment/*` |
 | **lerobot** | `~/work/lerobot` | Dataset format (LeRobot v2.1/v3) — what collection writes, what playback/openpi read. | Library; datasets under `…/outputs/lerobot` |
 | **franky `robot_server`** *(backend A)* | NUC1 (v2 plan) | Sole modern libfranka client; HTTP/WS arm+gripper API. `dashboards/openpi.py`'s `RS` client targets this. | FastAPI `:4242`, systemd `franka-robot-server` |
-| **DROID / polymetis** *(backend B)* | NUC1 `droid-nuc-fr3` container (current) | The controller collect/rlinf + `DroidLikeClient` use today; zerorpc `run_server.py` → `franka_panda_client`. | zerorpc `:4242` |
+| **DROID / polymetis** *(backend B)* | NUC1 `droid-nuc-fr3` container (current) | The controller collect/rlinf + `DroidLikeClient` use today; zerorpc `run_server.py` → `franka_panda_client`. Setup: [CONTROLLER.md](CONTROLLER.md). | zerorpc `:4242` |
 | **ZED SDK / pyzed** | Desktop `/usr/local/zed` | Cameras; each dashboard's `CamManager` opens/holds/releases them. | USB3; pyzed 5.3 |
 | **FR3 + Desk** | robot `172.16.0.1` | Hardware + FCI activation/brakes. | Desk HTTPS |
 

@@ -55,6 +55,11 @@ ping -c1 172.16.0.1 && ping -c1 172.16.0.2     # FR3 + NUC1 reachable
 
 ## 3. NUC1 setup (controller)  ✅ verified 2026-06-22
 
+> **Full controller build + config guide:** [CONTROLLER.md](CONTROLLER.md) — how
+> `droid-nuc-fr3:0.18.1` is built (libfranka 0.13.5 → 0.18.1), what the compose
+> mounts, the control contract, and which files in `~/polymetis_fr3/` are live vs
+> deprecated. This section is the bench-level summary.
+
 **Base:** Ubuntu **22.04.5** + **RT kernel `5.15.0-1105-realtime`**, user `tasl`,
 Docker installed, `tasl` in the `docker` group. Cat6 to the FR3.
 

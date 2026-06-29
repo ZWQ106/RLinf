@@ -18,6 +18,7 @@ tasl/
     smoke_droid_client.py  standalone smoke test for the above
   tools/
     zed_viewer.py    dual ZED 2i MJPEG viewer (:8002)
+  controller/        NUC polymetis controller config (compose, parameters.py, Dockerfile, conf/) — see docs/CONTROLLER.md
   launch/            self-contained Desktop launchers (lib.sh + start_*.sh + stop.sh)
   logs/              runtime logs (gitignored)
   docs/              handoff notes
