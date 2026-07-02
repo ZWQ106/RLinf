@@ -51,10 +51,12 @@ from PIL import Image
 SN_ZED_2I_RIGHT = 36443134
 SN_ZED_MINI_WRIST = 17150101
 
-# Default home pose from tools/calibration/anchors/eth_right_cam.yaml.
-# Overridden at runtime by `home_store` if a user has clicked "Set home"
-# before — that captures whatever the arm's current q is and persists.
-HOME_Q_DEFAULT = [-0.049, 0.004, 0.532, -1.752, 0.341, 2.118, -0.281]
+# Default home pose = the DROID anchor pose, MUST match the env config's
+# `joint_reset_qpos` (realworld_franka_jointvel_polymetis.yaml) — the dashboard
+# overrides the eval's joint_reset_qpos with this on Start, so a mismatch homes
+# the arm somewhere the policy was never reset to. Overridden at runtime by
+# `home_store` if a user has clicked "Set home" (captures + persists current q).
+HOME_Q_DEFAULT = [0.0, -0.6283, 0.0, -2.5133, 0.0, 1.8850, 0.0]
 HOME_STORE_PATH = pathlib.Path("/home/franka_desktop/_dashboard_home.json")
 
 
@@ -689,10 +691,14 @@ class RS:
         finally:
             c.close()
 
-    def go_home(self, target_q, dynamics_factor: float = 0.05):
+    def go_home(self, target_q, dynamics_factor: float = 0.05,
+                gripper_cmd: float = 0.0):
+        # gripper_cmd defaults to 0.0 = OPEN: homing is the pre-episode reset,
+        # so the arm should return to the anchor with an open gripper (else it
+        # stays whatever it was, e.g. still closed from a prior grasp).
         c = DroidClient(self.addr, timeout=30)
         try:
-            err = c.move_to_joint_target(list(target_q))
+            err = c.move_to_joint_target(list(target_q), gripper_cmd=gripper_cmd)
             ok = err < 0.03
             return {"ok": ok, "max_joint_error_rad": round(err, 4),
                     "msg": (f"home done, max joint error {err:.4f} rad" if ok else
