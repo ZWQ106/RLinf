@@ -120,7 +120,7 @@ step "  cameras: both ZEDs free ($ZED_EXTERIOR exterior, $ZED_WRIST wrist)"
 zeds_free || die "ZEDs not both free/present — reseat the exterior 2i USB; ensure no dashboard/eval holds them."
 
 step "  reap stale eval procs in rlinf-eval"
-desk "docker exec rlinf-eval bash -lc 'pkill -9 -f eval_embodied_agent.py; pkill -9 -f \"[r]ay::\"; pkill -9 -f \"[r]aylet\"; pkill -9 -f \"[P]olymetisController\"; /opt/venv/openpi/bin/ray stop --force 2>/dev/null; rm -rf /tmp/ray; true'"
+desk "docker exec rlinf-eval bash -lc 'pkill -9 -f \"[e]val_embodied_agent.py\"; pkill -9 -f \"[r]ay::\"; pkill -9 -f \"[r]aylet\"; pkill -9 -f \"[P]olymetisController\"; /opt/venv/openpi/bin/ray stop --force 2>/dev/null; rm -rf /tmp/ray; true'"
 
 step "  launch eval dashboard :8003 (--mode host, polymetis zerorpc backend)"
 desk "cd $TASL && ulimit -n 8192 && PYTHONPATH=$TASL:$SITE_PKGS NUC1_HOST=$NUC1_HOST setsid /usr/bin/python3 dashboards/rlinf.py --port 8003 --mode host </dev/null >> $TASL/logs/eval.log 2>&1 &"
