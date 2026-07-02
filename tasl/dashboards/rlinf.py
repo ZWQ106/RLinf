@@ -267,9 +267,19 @@ class EvalRunner:
                 return "already running"
             self.last_prompt = prompt
 
-            # NOTE: dashboard now owns cameras permanently. Env consumes
-            # frames via HTTP (/cam/<name>.jpg) — no cam handoff, no USB
-            # tantrums on start/stop. Do NOT call cam_mgr.stop() here.
+            # The in-container RLinf env opens the ZEDs DIRECTLY over pyzed
+            # (NodeProbe hardware enumeration + FrankaJointVelEnv) and needs
+            # EXCLUSIVE USB access — it is not (yet) served frames over HTTP
+            # (EVAL.md §7). Release our handles and wait until the cameras are
+            # provably openable from inside the container before launching,
+            # else the eval dies at "No zed cameras are connected" (NodeProbe)
+            # or "CAMERA FAILED TO SETUP" (env.reset). Mirrors collect.py's
+            # proven handoff; the dashboard re-opens them on eval exit.
+            if self.cam_mgr.is_running():
+                _log.info("releasing ZEDs for the in-container eval…")
+                self.cam_mgr.stop()
+                if HOST_MODE:
+                    self._wait_cameras_released()
 
             # 1. Clean old data dir (LeRobot writer refuses to overwrite).
             if HOST_MODE:
@@ -360,9 +370,54 @@ class EvalRunner:
         if self.proc is None:
             return
         self.proc.wait()
-        # Cams stay open across eval cycles now; nothing to do here beyond
-        # logging the exit code.
         _log.info(f"eval exited rc={self.proc.returncode}")
+        # The eval owned the ZEDs while it ran; reclaim them so the idle
+        # dashboard preview + policy-view tiles come back.
+        try:
+            _log.info(f"reclaiming ZEDs: {self.cam_mgr.start()}")
+        except Exception as e:
+            _log.warning(f"camera reclaim failed: {e}")
+
+    def _wait_cameras_released(self, settle_s: float = 3.0,
+                               budget_s: float = 40.0) -> None:
+        """Block until the ZEDs are provably openable from inside the container.
+
+        After our in-process ``cam.close()`` the USB teardown is unclean: a
+        ``get_device_list`` "AVAILABLE" is NOT sufficient (``open()`` still
+        fails mid-teardown). So open+close each camera from the container,
+        retrying until it succeeds, so the env's open lands on a warm device.
+        Ported from ``collect.py._wait_cameras_released`` (host mode only).
+        """
+        time.sleep(settle_s)
+        serials = [int(s) for s in self.cam_mgr.serials.values()]
+        probe = (
+            "import pyzed.sl as sl, time, sys\n"
+            f"sns={serials}\n"
+            f"deadline=time.time()+{budget_s}\n"
+            "while time.time()<deadline:\n"
+            "    ok=True\n"
+            "    for sn in sns:\n"
+            "        c=sl.Camera(); ip=sl.InitParameters()\n"
+            "        ip.set_from_serial_number(sn); ip.depth_mode=sl.DEPTH_MODE.NONE\n"
+            "        st=c.open(ip)\n"
+            "        if str(st)=='SUCCESS': c.close()\n"
+            "        else: ok=False; break\n"
+            "    if ok: print('PROBE_OK'); sys.exit(0)\n"
+            "    time.sleep(2)\n"
+            "print('PROBE_FAIL'); sys.exit(1)\n"
+        )
+        try:
+            r = subprocess.run(
+                ["docker", "exec", CONTAINER_NAME,
+                 "/opt/venv/openpi/bin/python", "-c", probe],
+                capture_output=True, timeout=budget_s + 25.0,
+            )
+            if r.returncode == 0 and b"PROBE_OK" in r.stdout:
+                _log.info("cameras open-verified from container")
+                return
+            _log.warning("camera open-probe did not confirm; launching anyway")
+        except Exception as e:
+            _log.warning(f"camera open-probe failed: {e}; launching anyway")
 
     def stop(self) -> str:
         with self._lock:
