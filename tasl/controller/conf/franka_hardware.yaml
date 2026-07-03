@@ -7,7 +7,12 @@ robot_client:
   use_real_time: ${use_real_time}
   metadata_cfg:
     _target_: polymetis.robot_client.metadata.RobotClientMetadata
-    default_Kq: [40, 30, 50, 25, 35, 25, 10]
+    # Softened 2026-07-03 for compliant GELLO teleop + safe object contact during
+    # calibration testing — halved joint stiffness so the arm yields on collision
+    # (gravity is compensated feed-forward, so it still holds pose). Keeping Kqd
+    # makes it slightly overdamped = stable, no oscillation. Original (stiffer)
+    # values: Kq [40, 30, 50, 25, 35, 25, 10]. Restore those for accurate tracking.
+    default_Kq: [20, 15, 25, 12, 18, 12, 5]
     default_Kqd: [4, 6, 5, 5, 3, 2, 1]
     default_Kx: [400, 400, 400, 15, 15, 15]
     default_Kxd: [37, 37, 37, 2, 2, 2]
