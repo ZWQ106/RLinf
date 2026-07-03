@@ -32,7 +32,7 @@ robot/camera/policy logic itself.
 |---|---|---|---|
 | **`tasl/` (this dir)** | `~/RLinf/tasl` | 3 dashboards, NUC client wrapper, launch scripts, ZED viewer. Control plane only. | Flask `:8003/:8004`, `http.server` MJPEG `:8002` |
 | **openpi** | `~/work/openpi` | VLA policy: `serve_policy.py` serves a pi05_droid checkpoint over WebSocket; `openpi-client` is the inference client `dashboards/openpi.py` imports. | Python WS server `:8000` |
-| **RLinf** | `~/RLinf`, `~/work/rlinf-clone` | Embodied RL/data framework: `collect_real_data.py`, `eval_embodied_agent.py`, `rlinf/envs/realworld/franka/*` (env, polymetis controller, GELLO teleop), configs. Runs in the `rlinf-eval` container. | Python + Ray; `examples/embodiment/*` |
+| **RLinf** | `~/RLinf` (mounted into `rlinf-eval` at `/workspace/rlinf`) | Embodied RL/data framework: `collect_real_data.py`, `eval_embodied_agent.py`, `rlinf/envs/realworld/franka/*` (env, polymetis controller, GELLO teleop), configs. Data on the separate `~/rlinf_data` mount. | Python + Ray; `examples/embodiment/*` |
 | **lerobot** | `~/work/lerobot` | Dataset format (LeRobot v2.1/v3) — what collection writes, what playback/openpi read. | Library; datasets under `…/outputs/lerobot` |
 | **franky `robot_server`** *(backend A)* | NUC1 (v2 plan) | Sole modern libfranka client; HTTP/WS arm+gripper API. `dashboards/openpi.py`'s `RS` client targets this. | FastAPI `:4242`, systemd `franka-robot-server` |
 | **DROID / polymetis** *(backend B)* | NUC1 `droid-nuc-fr3` container (current) | The controller collect/rlinf + `DroidLikeClient` use today; zerorpc `run_server.py` → `franka_panda_client`. Setup: [CONTROLLER.md](CONTROLLER.md). | zerorpc `:4242` |
@@ -69,7 +69,11 @@ Desk Activate FCI → dashboards.
 
 - **Backend split** (A vs B above) — collect/rlinf should eventually move to the
   franky `robot_server` so there's one controller path.
-- **Path drift** — `dashboards/collect.py` / `rlinf.py` still reference the old
-  `~/work/rlinf-clone` checkout and the `rlinf-eval` container, not `~/RLinf`.
-- **Diverged branch** — fork `tasl-bench-polymetis-controller` (`6640d523`,
-  teleop/GELLO) vs local `~/work/rlinf-clone` (`a253363f`) need reconciliation.
+- ~~**Path drift**~~ — RESOLVED 2026-07-03: the container mounts `~/RLinf`
+  directly, data is on `~/rlinf_data`, and dashboard paths are env-driven
+  (`RLINF_REPO_HOST` / `RLINF_DATA_DIR`, see the tasl README). `~/work/rlinf-clone`
+  is retired.
+- **In-container GELLO deps** — `zerorpc`/`dynamixel-sdk`/`gello`/`gello_teleop` are
+  not in the base image; `ensure_container_deps` (`launch/lib.sh`) reinstalls them
+  from source, and the leader calibration lives in-repo (`fr3_gello_config.py`).
+  A `docker commit`-ed image would remove the per-launch reinstall.

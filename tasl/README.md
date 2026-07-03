@@ -41,18 +41,25 @@ you rename anything.
 mounted at `/workspace/rlinf`, so it self-locates at
 `/workspace/rlinf/tasl/dashboards/rlinf.py` — no separate copy/mount needed.
 
-## ⚠️ Operational paths NOT yet repointed
+## Paths & configuration (consolidated 2026-07-03)
 
-These still reference the *old* `work/rlinf-clone` checkout and the existing
-container/host conventions. They were left as-is during the file move and must
-be reviewed before this becomes the live checkout:
+The `rlinf-eval` container now mounts **`~/RLinf`** at `/workspace/rlinf` (one
+checkout for host tooling *and* the in-container framework), with data on a
+separate **`~/rlinf_data`** mount so a code swap never touches collected data.
+Host paths are **env-driven** (single source of truth in `launch/lib.sh`, matching
+defaults derived in Python) — nothing is hard-coded to a specific checkout:
 
-- `dashboards/collect.py`: `CONTAINER = "rlinf-eval"`,
-  `LIVE_CAM_DIR_HOST` and `DATASET_ROOTS` → `…/work/rlinf-clone/outputs/...`
-- `dashboards/rlinf.py`: `DEFAULT_REPO_PATH_HOST = …/work/rlinf-clone`,
-  `EVAL_SCRIPT` under it.
+- `launch/lib.sh`: `RLINF_REPO_HOST` (repo, auto-derived from the script location),
+  `RLINF_DATA_DIR` (`~/rlinf_data`), `RLINF_CONTAINER`, `RLINF_IMAGE`, `CKPT_HOST`.
+  `ensure_rlinf_container` is the version-controlled `docker run` recipe;
+  `ensure_container_deps` reinstalls the GELLO stack when missing.
+- `dashboards/rlinf.py`: `DEFAULT_REPO_PATH_HOST` = `RLINF_REPO_HOST` or
+  `Path(__file__).parents[2]`; `CONTAINER_NAME` = `RLINF_CONTAINER`.
+- `dashboards/collect.py`: `DATA_DIR_HOST` = `RLINF_DATA_DIR`; `LIVE_CAM_DIR_HOST`
+  and `DATASET_ROOTS` derive from it.
 - `dashboards/{openpi,rlinf}.py`: `HOME_STORE_PATH = /home/franka_desktop/_dashboard_home.json`
-  (shared runtime home-pose state, lives at host home — intentionally outside the repo).
+  (shared runtime home-pose state at host home — intentionally outside the repo).
 
-Decide whether the `rlinf-eval` container should mount `~/RLinf` instead of
-`~/work/rlinf-clone`; if so, update the paths above to match.
+To repoint the container mounts: `docker rm -f rlinf-eval`, then re-run any
+launcher (it recreates the container via `ensure_rlinf_container`). `~/work/rlinf-clone`
+is retired.

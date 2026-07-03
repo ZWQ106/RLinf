@@ -37,12 +37,17 @@ controller, same `:4242`, same FCI bring-up as teleop.
 
 ## 1. One-time prerequisite — unified eval checkout (pi05 inference on the polymetis branch)
 
-The eval reuses the **polymetis-controller** branch (which already drives the arm
+> **Consolidated 2026-07-03:** the `rlinf-eval` container now mounts **`~/RLinf`**
+> at `/workspace/rlinf` (not `~/work/rlinf-clone`, which is retired), and the eval
+> code below is merged into it. Data is on the separate `~/rlinf_data` mount. See
+> [SETUP.md](SETUP.md) and the tasl README for the container recipe + env vars.
+
+The eval reuses the **polymetis-controller** work (which already drives the arm
 for collect) and adds **only the pi05_droid inference** on top. The mounted
-checkout `~/work/rlinf-clone` (branch `tasl-bench-polymetis-controller`) already
-has the controller (`polymetis_controller.py`, `droid_zerorpc_client.py`, the
-polymetis `FrankaJointVelEnv`, `RealWorldEnv.chunk_step`) and the openpi action
-model. What it still **needs** (the integration work, see §7):
+checkout `~/RLinf` already has the controller (`polymetis_controller.py`,
+`droid_zerorpc_client.py`, the polymetis `FrankaJointVelEnv`,
+`RealWorldEnv.chunk_step`) and the openpi action model, plus the integration
+pieces below:
 
 - `rlinf/models/embodiment/openpi/dataconfig/droid_dataconfig.py` — register the
   **`pi05_droid`** TrainConfig (mirror the existing `pi05_droid_polaris`, point
@@ -159,11 +164,9 @@ pi05_droid inference over the polymetis controller`):
   `num_action_chunks: 8`, `use_gello: False`).
 - `rlinf.py` eval spawn → `config_name = realworld_eval_pi05_droid_polymetis`.
 
-> The integration branch carries `~/work/rlinf-clone`'s pre-existing uncommitted
-> collect WIP untouched; only the 4 inference files were committed. To run eval,
-> the container must mount a checkout that has this branch's code (it currently
-> mounts `~/work/rlinf-clone`, so checking that branch out — or recreating
-> `rlinf-eval` against it — is the deploy step).
+> This inference code is now merged into `~/RLinf`, which the `rlinf-eval`
+> container mounts (consolidated 2026-07-03). No separate checkout/branch step:
+> the launchers build the container against `~/RLinf` via `ensure_rlinf_container`.
 
 **☐ TODO — dashboard robot panel zerorpc swap (best done + validated at the bench).**
 `rlinf.py` still drives its robot panel over HTTP `RS` (franky). The eval *run*

@@ -107,8 +107,11 @@ Idle state shows live ZED previews + green robot status.
 **Gripper convention:** state `gripper_position ∈ [0,1]`, **1 = closed**;
 action `[7] ∈ [0,1]`, **0 = open / 1 = close**.
 
-**Data lands in:** `~/work/rlinf-clone/outputs/lerobot/` (LeRobot v2.1), plus a
-per-run `outputs/collect_<timestamp>/`. Verify: `ls -lt ~/work/rlinf-clone/outputs/lerobot/`.
+**Data lands in:** `~/rlinf_data/outputs/lerobot/` (LeRobot v2.1), plus a
+per-run `~/rlinf_data/outputs/collect_<timestamp>/`, and datasets under
+`~/rlinf_data/datasets/`. Verify: `ls -lt ~/rlinf_data/outputs/lerobot/`.
+(Data lives outside the code checkout; the container sees it at
+`/workspace/rlinf/{datasets,outputs}` — see [SETUP.md](SETUP.md).)
 
 ---
 
@@ -141,6 +144,8 @@ Two different things:
 | Huge `ray::… "" "" …` zombie dump on Stop | Ray reporting already-dead (zombie) procs it can't re-kill | Harmless — ignore. They clear on the next `rlinf-eval` restart. |
 | NUC1 unreachable in Stage 1 | Robot net down / NUC off | `ping 172.16.0.2`; check the cable/switch and that NUC1 is powered. |
 | `/dev/gello` missing | GELLO unplugged or udev rule not applied | Replug; check `ls /dev/serial/by-id/`. |
+| `AssertionError: Port /dev/gello not in config map` | GELLO leader calibration not registered (e.g. after a container rebuild that dropped the deps) | The calibration is in-repo (`fr3_gello_config.py`) and injected by `gello_joint_intervention`; ensure the GELLO deps are installed (`ensure_container_deps` / re-run `teleop.sh`). See [GELLO calibration](#gello-calibration). |
+| One joint lurches ~90° on the first teleop tick | That joint's GELLO offset is wrong by π/2 | Flip that joint's entry in `FR3_GELLO_OFFSETS_PI_2` (`fr3_gello_config.py`) and re-verify. See [GELLO calibration](#gello-calibration). |
 
 **FCI exclusivity (root cause of most controller hangs):** only one FCI client at
 a time. The franky `robot_server` (systemd `franka-robot-server`) must be
@@ -150,12 +155,54 @@ Stage 1, but if that ssh step fails, bootstrap will hang. Verify on NUC1:
 
 ---
 
-## 8. Quick reference
+## 8. GELLO calibration
+
+The GELLO leader (OpenRB-150 on `/dev/gello`) needs a per-leader
+`DynamixelRobotConfig` — joint IDs, **offsets** (multiples of π/2), **signs**, and
+**gripper** open/close. `gello_software` ships only stock FTDI configs, so ours is
+kept **in the repo** and injected into gello's `PORT_CONFIG_MAP` at runtime:
+
+- **Config:** `rlinf/envs/realworld/common/gello/fr3_gello_config.py`
+  (`FR3_GELLO_OFFSETS_PI_2`, `FR3_GELLO_JOINT_SIGNS`, `FR3_GELLO_GRIPPER_CONFIG`).
+- **Injected by:** `GelloJointIntervention.__init__` → `register_fr3_gello_config()`
+  before the agent opens the port. Keeping it in-repo (not hand-edited into the
+  ephemeral `gello_software` install) is why it survives a container rebuild.
+
+**Re-calibrate** when the leader is re-assembled, or if the config is ever lost.
+Offsets snap to π/2, so you only need the leader within ±45° of the start pose.
+
+1. **Raw offsets** — hold the leader at `START = [0,0,0,-1.571,0,1.571,0]`, gripper
+   fully **open**, and run:
+   ```bash
+   docker exec rlinf-eval /opt/venv/openpi/bin/python \
+     /opt/gello_software/scripts/gello_get_offset.py \
+     --port /dev/gello --start-joints 0 0 0 -1.571 0 1.571 0 \
+     --joint-signs 1 -1 1 -1 1 1 1 --gripper
+   ```
+   Read `best offsets function of pi` (the `N*np.pi/2` list) and the gripper
+   open/close degrees. Base joints are hard to hold steady — expect a couple of
+   joints to be ambiguous across runs.
+2. **Validate per joint** — put the candidate offsets into `fr3_gello_config.py`,
+   then confirm each joint independently against the homed **robot** (a rigid
+   reference, far better than holding in air): with the arm at the home pose, hold
+   the leader to match and check that each `q_gello − q_robot` is small. Any joint
+   stuck near ±π/2 → its offset is wrong by one step; adjust that entry.
+3. Current values were re-derived **2026-07-03**: offsets `[2,0,0,2,2,1,2]`, signs
+   `[1,-1,1,-1,1,1,1]`, gripper `(8,264,222)`.
+
+> Note: the calibration is **not** in the base image or in `gello_software` — only
+> in `fr3_gello_config.py`. Do not hand-edit `PORT_CONFIG_MAP` in the container; it
+> lives in the ephemeral layer and is lost on rebuild.
+
+---
+
+## 9. Quick reference
 
 - **Dashboard:** `http://100.79.65.37:8004` (Tailscale) / `http://localhost:8004`
 - **DROID home pose (rad):** `[0, -0.6283, 0, -2.5133, 0, 1.8850, 0]`
 - **Controller:** zerorpc `tcp://172.16.0.2:4242` (robot net)
 - **Config:** `realworld_collect_data_polymetis_jointvel` + `env.eval.gello_port=/dev/gello`
 - **Logs:** `~/RLinf/tasl/logs/collect.log`
-- **Data:** `~/work/rlinf-clone/outputs/lerobot/`
+- **Data:** `~/rlinf_data/outputs/lerobot/` (datasets: `~/rlinf_data/datasets/`)
+- **GELLO calibration:** `rlinf/envs/realworld/common/gello/fr3_gello_config.py`
 - **Ports:** collect `:8004`, openpi `:8003`, serve_policy `:8000`, zed_viewer `:8002`

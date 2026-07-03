@@ -153,32 +153,49 @@ present; the dashboard runs under sudo to access it.
 
 **`rlinf-eval` container** (hosts the RL env / collection):
 - Image `rlinf/rlinf:agentic-rlinf0.2-pi05droid-zed`, **host network, privileged**.
-- Mounts: `work/rlinf-clone → /workspace/rlinf`, `/usr/local/cuda`, `/usr/local/zed`,
-  `ckpts/pi05_droid_pt → /ckpts/pi05_droid_pt`, and **`/dev → /dev`** (so it sees
-  `/dev/gello`, `/dev/video*`, `/dev/uinput`).
-- In-container Python: `/opt/venv/openpi/bin/python`.
-- The collection run is `examples/embodiment/collect_real_data.py` from the mounted
-  checkout. (Note: the container mounts **`work/rlinf-clone`**, not `~/RLinf` — see
-  the path-drift note in the repo README.)
+- Mounts (**consolidated 2026-07-03**): **`~/RLinf → /workspace/rlinf`** (code),
+  **`~/rlinf_data/datasets` + `~/rlinf_data/outputs`** (data — kept *outside* the
+  code checkout so swapping the mounted code never touches collected data),
+  `/usr/local/cuda`, `/usr/local/zed`, `ckpts/pi05_droid_pt → /ckpts/pi05_droid_pt`,
+  and **`/dev → /dev`** (so it sees `/dev/gello`, `/dev/video*`, `/dev/uinput`).
+- **Created/started by `ensure_rlinf_container` in `launch/lib.sh`** — the canonical
+  `docker run` recipe (mounts are version-controlled, not a hand-run command).
+  Mounts are fixed at creation; to repoint them: `docker rm -f rlinf-eval`, then
+  re-run any launcher. Override paths with `RLINF_REPO_HOST` / `RLINF_DATA_DIR` /
+  `RLINF_CONTAINER` / `RLINF_IMAGE` (defaults in `lib.sh`).
+- **In-container GELLO deps** (`zerorpc`, `dynamixel-sdk`, `gello`, `gello_teleop`)
+  are NOT in the base image — `ensure_container_deps` (also `lib.sh`) reinstalls
+  them from source (PyPI + `wuphilipp/gello_software` + `RLinf/gello-teleop`) when
+  missing, so a container rebuild self-heals. The GELLO leader **calibration** lives
+  in the repo at `rlinf/envs/realworld/common/gello/fr3_gello_config.py` (injected
+  into gello's `PORT_CONFIG_MAP` at runtime) — see [TELEOP.md](TELEOP.md#gello-calibration).
+- In-container Python: `/opt/venv/openpi/bin/python`. The collection run is
+  `examples/embodiment/collect_real_data.py` from the mounted `~/RLinf` checkout.
 
 ---
 
 ## 5. Repos & layout (Desktop)
 
 ```
-~/RLinf/                      # the fork (github.com/tasl-lab/RLinf), origin=fork
-│   └── tasl/                 # ← OUR bench tooling (dashboards, launch, docs)
-└── work/
-    ├── rlinf-clone/          # RLinf checkout the rlinf-eval container mounts
-    ├── openpi/               # VLA policy (serve_policy + openpi-client)
-    └── lerobot/              # dataset format
+~/RLinf/                      # THE fork checkout (github.com/tasl-lab/RLinf);
+│   │                         #   ALSO mounted into rlinf-eval at /workspace/rlinf
+│   ├── tasl/                 # ← OUR bench tooling (dashboards, launch, docs)
+│   └── rlinf/ examples/ …    #   the RLinf framework the container runs
+~/rlinf_data/                 # collected data, OUTSIDE the repo (survives code swaps)
+│   ├── datasets/             #   → /workspace/rlinf/datasets  (LeRobot + raw SVO)
+│   └── outputs/              #   → /workspace/rlinf/outputs   (lerobot, live_cam, logs)
 ~/ckpts/pi05_droid_pt/        # policy checkpoint (mounted into rlinf-eval)
+~/work/                       # legacy support checkouts:
+    ├── openpi/               #   VLA policy (serve_policy + openpi-client)
+    ├── lerobot/              #   dataset format
+    └── rlinf-clone/          #   DEPRECATED — old container mount, no longer used
 ```
 
-Bench tooling is on branch **`franka-fr3/bench`** under `~/RLinf/tasl/`. Clone:
+Since **2026-07-03 the container mounts `~/RLinf` directly** (one checkout for both
+host tooling and the in-container framework); `~/work/rlinf-clone` is retired. Clone:
 ```bash
 git clone https://github.com/tasl-lab/RLinf ~/RLinf
-cd ~/RLinf && git checkout franka-fr3/bench
+cd ~/RLinf   # bench tooling lives under tasl/ ; launchers build the container
 ```
 
 ---
@@ -218,4 +235,5 @@ cd ~/RLinf && git checkout franka-fr3/bench
 | GELLO | `/dev/gello` (vendor 2f5d / product 2202) |
 | ZED serials | 2i `36443134`, `34825630`; Mini wrist `17150101` |
 | Home pose (rad) | `[0, -0.6283, 0, -2.5133, 0, 1.8850, 0]` |
-| Data | `~/work/rlinf-clone/outputs/lerobot/` |
+| Data | `~/rlinf_data/{datasets,outputs}/` (outputs/lerobot for LeRobot) |
+| GELLO calibration | `rlinf/envs/realworld/common/gello/fr3_gello_config.py` (in-repo) |
