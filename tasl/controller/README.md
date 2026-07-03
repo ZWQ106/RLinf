@@ -30,6 +30,26 @@ docker compose up -d
 Edit `parameters.py` / `conf/franka_hardware.yaml` if the bench IPs differ, then
 commit the change here so every NUC stays in sync.
 
+## Update a running NUC's parameters — `deploy.sh`
+
+To push config changes (impedance gains, limits, IPs) to an already-running NUC
+and restart the controller so it re-reads them, run **from the Desktop**:
+
+```bash
+cd ~/RLinf/tasl/controller
+./deploy.sh                                  # push conf -> NUC1, restart, wait :4242
+./deploy.sh --kq "20 15 25 12 18 12 5"       # set joint stiffness first, then deploy
+./deploy.sh --no-restart                     # copy only (apply on next restart)
+LAUNCH_DRY_RUN=1 ./deploy.sh                  # print actions only
+```
+
+`--kq` rewrites `default_Kq` in `conf/franka_hardware.yaml` (lower = softer/more
+compliant — the arm yields on contact; gravity is compensated so it still holds
+pose). The config files are bind-mounted (see `docker-compose.yaml`), so the
+restart re-reads them. **A restart drops FCI** — afterwards re-Activate FCI in
+Desk and Recover/Home in the dashboard, or just run `sudo ../launch/teleop.sh`.
+The NUC host defaults to `$NUC1_HOST` (`172.16.0.2`); override with an env var.
+
 ## Notes
 
 - **Only `parameters.py` is a real override.** `conf/franka_hardware.yaml` and
