@@ -84,7 +84,7 @@ fi
 # ── Stage 3/4 — Desktop eval dashboard (rlinf.py, host mode) ────────────────
 step "Stage 3/4 — eval dashboard :8003 (rlinf.py --mode host)"
 step "  rlinf-eval container up"
-desk "docker start rlinf-eval"
+ensure_rlinf_container
 
 step "  preflight: polymetis eval config + chunk env present in /workspace/rlinf"
 if [[ -z "$LAUNCH_DRY_RUN" ]]; then
@@ -96,7 +96,7 @@ if [[ -z "$LAUNCH_DRY_RUN" ]]; then
       [ -e "/workspace/rlinf/$p" ] || echo "$p"
     done' 2>/dev/null || echo "DOCKER_EXEC_FAILED")
   if [[ -n "$miss" ]]; then
-    die "the mounted checkout (/workspace/rlinf = work/rlinf-clone) is MISSING eval code:
+    die "the mounted checkout (/workspace/rlinf = $RLINF_REPO_HOST) is MISSING eval code:
 $(printf '      - %s\n' $miss)
     This needs the polymetis-controller branch PLUS the pi05_droid inference port
     (see docs/EVAL.md §1). Mount the unified eval checkout before running."

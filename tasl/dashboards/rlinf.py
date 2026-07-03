@@ -96,9 +96,11 @@ class HomeStore:
 
 # Path layout — defaults assume running in container; flip via --mode host
 # at launch time. Container paths are mounted-in; host paths are real host fs.
-CONTAINER_NAME = "rlinf-eval"
+CONTAINER_NAME = os.environ.get("RLINF_CONTAINER", "rlinf-eval")
 DEFAULT_REPO_PATH_CONTAINER = "/workspace/rlinf"
-DEFAULT_REPO_PATH_HOST = "/home/franka_desktop/work/rlinf-clone"
+DEFAULT_REPO_PATH_HOST = os.environ.get(
+    "RLINF_REPO_HOST", "/home/franka_desktop/RLinf"
+)
 # Resolved at launch (set in main()):
 REPO_PATH: pathlib.Path = pathlib.Path(DEFAULT_REPO_PATH_CONTAINER)
 CONFIG_DIR: pathlib.Path = REPO_PATH / "examples/embodiment/config"

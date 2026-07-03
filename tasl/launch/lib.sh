@@ -31,6 +31,19 @@ REPO="$DESKTOP_HOME/RLinf"          # consolidated fork checkout (tasl-lab/RLinf
 TASL="$REPO/tasl"                   # bench operator tooling lives here
 SITE_PKGS="$DESKTOP_HOME/.local/lib/python3.10/site-packages"
 
+# --- consolidated code + data locations (SINGLE SOURCE OF TRUTH) -------------
+# Code lives in ONE checkout ($REPO = ~/RLinf), mounted into the container at
+# /workspace/rlinf. DATA (datasets + outputs) lives OUTSIDE the repo so swapping
+# the code checkout never touches collected data. The dashboards read these
+# same env vars (with matching defaults), so paths are defined here, not
+# hard-coded in Python. Override any with an env var before launch.
+RLINF_REPO_HOST="${RLINF_REPO_HOST:-$REPO}"                    # host code -> /workspace/rlinf
+RLINF_DATA_DIR="${RLINF_DATA_DIR:-$DESKTOP_HOME/rlinf_data}"   # host datasets/ + outputs/
+RLINF_CONTAINER="${RLINF_CONTAINER:-rlinf-eval}"
+RLINF_IMAGE="${RLINF_IMAGE:-rlinf/rlinf:agentic-rlinf0.2-pi05droid-zed}"
+CKPT_HOST="${CKPT_HOST:-$DESKTOP_HOME/ckpts/pi05_droid_pt}"
+export RLINF_REPO_HOST RLINF_DATA_DIR RLINF_CONTAINER RLINF_IMAGE
+
 # --- logging ---
 step() { printf '\033[36m▶ %s\033[0m\n' "$*"; }
 ok()   { printf '\033[32m✓ %s\033[0m\n' "$*"; }
@@ -51,6 +64,42 @@ ensure_root() {
 # --- local command runner (dry-run aware) ---
 # Runs a shell command line LOCALLY on the Desktop. In dry-run, just echoes it.
 desk() { if [[ -n "$LAUNCH_DRY_RUN" ]]; then echo "DRY: $*"; return 0; fi; eval "$*"; }
+
+# --- rlinf-eval container: create with the canonical mounts, else (re)start ---
+# The bind mounts are the REAL source of truth for where in-container code +
+# data live, so they belong here in version control, not in a hand-run
+# `docker run`. Idempotent: reuses an existing container. Mounts are fixed at
+# creation time, so to REPOINT them (e.g. new code checkout / data dir):
+#     docker rm -f "$RLINF_CONTAINER"    # then re-run any launcher
+ensure_rlinf_container() {
+  if [[ -n "$LAUNCH_DRY_RUN" ]]; then
+    echo "DRY: ensure_rlinf_container $RLINF_CONTAINER (code=$RLINF_REPO_HOST data=$RLINF_DATA_DIR)"
+    return 0
+  fi
+  mkdir -p "$RLINF_DATA_DIR/datasets" "$RLINF_DATA_DIR/outputs"
+  if docker inspect "$RLINF_CONTAINER" >/dev/null 2>&1; then
+    docker start "$RLINF_CONTAINER" >/dev/null
+  else
+    step "creating $RLINF_CONTAINER (code=$RLINF_REPO_HOST, data=$RLINF_DATA_DIR)"
+    docker run -d --name "$RLINF_CONTAINER" \
+      --network host --privileged --gpus all --shm-size 64m \
+      -w /workspace/rlinf \
+      -v /dev:/dev \
+      -v "$RLINF_REPO_HOST:/workspace/rlinf" \
+      -v "$RLINF_DATA_DIR/datasets:/workspace/rlinf/datasets" \
+      -v "$RLINF_DATA_DIR/outputs:/workspace/rlinf/outputs" \
+      -v "$CKPT_HOST:/ckpts/pi05_droid_pt:ro" \
+      -v /usr/local/zed:/usr/local/zed:ro \
+      -v /usr/local/cuda:/usr/local/cuda:ro \
+      "$RLINF_IMAGE" -c 'sleep infinity' >/dev/null
+  fi
+  # Container runs as root over a franka_desktop-owned checkout; git refuses
+  # ("dubious ownership") which breaks Hydra's git-SHA logging + our checks.
+  # Idempotent allowlist of the mount path.
+  docker exec "$RLINF_CONTAINER" bash -lc \
+    'git config --global --get-all safe.directory 2>/dev/null | grep -qx /workspace/rlinf \
+       || git config --global --add safe.directory /workspace/rlinf' 2>/dev/null || true
+}
 
 # --- health checks (dry-run aware via DRY_* stubs) ---
 

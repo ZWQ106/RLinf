@@ -74,7 +74,7 @@ fi
 # ── Stage 3/4 — Desktop collect dashboard (GELLO teleop) ────────────────────
 step "Stage 3/4 — collect dashboard :8004"
 step "  rlinf-eval container up"
-desk "docker start rlinf-eval"
+ensure_rlinf_container
 step "  mutual exclusion: stop the other dashboard"
 kill_other_dashboard collect
 step "  cameras: both ZEDs free ($ZED_EXTERIOR exterior, $ZED_WRIST wrist)"

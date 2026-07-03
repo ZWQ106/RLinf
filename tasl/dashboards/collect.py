@@ -95,14 +95,17 @@ _log = logging.getLogger("collect_dashboard")
 SN_EXTERIOR = 36443134   # ZED 2i, exterior view
 SN_WRIST = 17150101      # ZED Mini, wrist-mounted
 
-CONTAINER = "rlinf-eval"
+CONTAINER = os.environ.get("RLINF_CONTAINER", "rlinf-eval")
 COLLECT_LOG = "/tmp/collect_dash.log"
 CONTAINER_PY = "/opt/venv/openpi/bin/python"
 # Host side of the bind mount where the in-container VideoPlayer writes live
 # per-camera JPEGs during a collection (container path:
 # /workspace/rlinf/outputs/live_cam via RLINF_LIVE_CAM_DIR). LiveCamSource
 # reads these to serve a live preview while the env owns the ZED cameras.
-LIVE_CAM_DIR_HOST = "/home/franka_desktop/work/rlinf-clone/outputs/live_cam"
+# Data root (datasets/ + outputs/) — matches lib.sh RLINF_DATA_DIR. Lives OUTSIDE
+# the code checkout so swapping the mounted code never touches collected data.
+DATA_DIR_HOST = os.environ.get("RLINF_DATA_DIR", "/home/franka_desktop/rlinf_data")
+LIVE_CAM_DIR_HOST = f"{DATA_DIR_HOST}/outputs/live_cam"
 # Start-gate sentinel the keyboard wrapper writes ("WAIT"/"RUN") inside the
 # container — Ray buffers actor stdout, so the dashboard reads this file
 # (docker exec cat) instead of parsing the log to drive the 开始下一条 button.
@@ -119,14 +122,15 @@ DROID_HOME_Q = [0.0, -0.6283, 0.0, -2.5133, 0.0, 1.8850, 0.0]
 
 VIRTUAL_KBD_NAME = "tasl-collect-dashboard-kbd"
 
-# Dataset manager. Host paths on the Desktop (the rlinf-clone bind mount).
+# Dataset manager. Host paths on the Desktop (the rlinf_data bind mount:
+# /home/franka_desktop/rlinf_data/{datasets,outputs} -> /workspace/rlinf/{datasets,outputs}).
 # Order is significant: root_index 0 = "current" scheme (fixed repo_id/root
 # datasets written under datasets/<name>), 1 = "legacy" (old per-run
 # timestamped outputs/lerobot/...). The UI groups + labels by this index.
 # Override with --dataset-roots (comma-separated, current-first).
 DATASET_ROOTS = [
-    "/home/franka_desktop/work/rlinf-clone/datasets",
-    "/home/franka_desktop/work/rlinf-clone/outputs/lerobot",
+    f"{DATA_DIR_HOST}/datasets",
+    f"{DATA_DIR_HOST}/outputs/lerobot",
 ]
 # Container-internal dataset root prefix (mounted as the host DATASET_ROOTS[0]).
 # Start passes repo_id/root/svo_dir under this so collect_real_data.py (running

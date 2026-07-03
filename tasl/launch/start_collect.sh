@@ -19,7 +19,7 @@ ensure_root "$0" "$@"
 preflight_robot collect
 
 step "Backend: rlinf-eval container up"
-desk "docker start rlinf-eval"
+ensure_rlinf_container
 ok "rlinf-eval up"
 
 step "Reap stale collection processes in rlinf-eval"
