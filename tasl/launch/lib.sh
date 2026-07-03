@@ -103,6 +103,33 @@ ensure_rlinf_container() {
   docker exec "$RLINF_CONTAINER" bash -lc \
     'git config --global --get-all safe.directory 2>/dev/null | grep -qx /workspace/rlinf \
        || git config --global --add safe.directory /workspace/rlinf' 2>/dev/null || true
+  ensure_container_deps
+}
+
+# --- in-container runtime deps (GELLO teleop stack) --------------------------
+# These are NOT in the base image and were previously pip-installed by hand into
+# the container's ephemeral layer (lost on 2026-07-03 when the container was
+# recreated). Reinstall them here — from version-controlled sources — whenever
+# they are missing, so a container rebuild restores the whole stack. The leader
+# CALIBRATION lives in the repo (rlinf/.../gello/fr3_gello_config.py), not here.
+ensure_container_deps() {
+  if [[ -n "$LAUNCH_DRY_RUN" ]]; then echo "DRY: ensure_container_deps"; return 0; fi
+  if docker exec "$RLINF_CONTAINER" /opt/venv/openpi/bin/python -c \
+       'import zerorpc, dynamixel_sdk, gello.agents.gello_agent, gello_teleop' 2>/dev/null; then
+    return 0   # fast path: already present
+  fi
+  step "installing in-container GELLO deps (zerorpc, dynamixel-sdk, gello, gello_teleop)"
+  docker exec "$RLINF_CONTAINER" bash -lc '
+    set -e
+    PIP=/opt/venv/openpi/bin/pip
+    "$PIP" install -q zerorpc dynamixel-sdk
+    if [ ! -e /opt/gello_software/pyproject.toml ] && [ ! -e /opt/gello_software/setup.py ]; then
+      git clone --recurse-submodules -q https://github.com/wuphilipp/gello_software.git /opt/gello_software
+    fi
+    "$PIP" install -q -e /opt/gello_software
+    "$PIP" install -q "gello-teleop @ git+https://github.com/RLinf/gello-teleop.git"
+  ' && ok "GELLO deps present" \
+    || warn "GELLO dep install had issues (see above) — teleop/collect may fail until fixed"
 }
 
 # --- health checks (dry-run aware via DRY_* stubs) ---

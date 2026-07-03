@@ -62,6 +62,16 @@ class GelloJointIntervention(gym.ActionWrapper):
         super().__init__(env)
         from gello_teleop.gello_teleop_agent import GelloTeleopAgent
 
+        # Inject the FR3 leader calibration into gello's PORT_CONFIG_MAP before
+        # opening the port — gello_software ships only stock configs and would
+        # otherwise assert "Port /dev/gello not in config map". Keeping the
+        # calibration in-repo (not in the ephemeral gello_software install) is
+        # what makes it survive a container rebuild.
+        from rlinf.envs.realworld.common.gello.fr3_gello_config import (
+            register_fr3_gello_config,
+        )
+
+        register_fr3_gello_config(port)
         self.agent = GelloTeleopAgent(port=port)
         self.kp = float(kp)
         self.vmax = float(vmax)
