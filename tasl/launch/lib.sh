@@ -26,8 +26,12 @@ if [[ -z "$TS_IP" ]]; then
   TS_IP="$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^172\.16\.0\.' | head -1)"
   TS_IP="${TS_IP:-$(hostname -I 2>/dev/null | awk '{print $1}')}"   # last resort: first IP
 fi
-DESKTOP_HOME=/home/franka_desktop
-REPO="$DESKTOP_HOME/RLinf"          # consolidated fork checkout (tasl-lab/RLinf)
+# Repo root derived from THIS file's location (<repo>/tasl/launch/lib.sh), so it
+# is correct wherever the checkout lives and survives the sudo re-exec — unlike
+# $HOME, BASH_SOURCE does not change to /root under sudo. DESKTOP_HOME is the dir
+# the repo + data sit under. Override the repo with RLINF_REPO_HOST.
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"   # consolidated checkout (~/RLinf)
+DESKTOP_HOME="$(dirname "$REPO")"   # home dir (repo + rlinf_data live here)
 TASL="$REPO/tasl"                   # bench operator tooling lives here
 SITE_PKGS="$DESKTOP_HOME/.local/lib/python3.10/site-packages"
 

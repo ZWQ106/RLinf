@@ -98,8 +98,11 @@ class HomeStore:
 # at launch time. Container paths are mounted-in; host paths are real host fs.
 CONTAINER_NAME = os.environ.get("RLINF_CONTAINER", "rlinf-eval")
 DEFAULT_REPO_PATH_CONTAINER = "/workspace/rlinf"
+# Host code checkout = the repo this dashboard lives in
+# (<repo>/tasl/dashboards/rlinf.py), derived from __file__ so it's correct
+# wherever the checkout lives. Override with RLINF_REPO_HOST.
 DEFAULT_REPO_PATH_HOST = os.environ.get(
-    "RLINF_REPO_HOST", "/home/franka_desktop/RLinf"
+    "RLINF_REPO_HOST", str(pathlib.Path(__file__).resolve().parents[2])
 )
 # Resolved at launch (set in main()):
 REPO_PATH: pathlib.Path = pathlib.Path(DEFAULT_REPO_PATH_CONTAINER)
