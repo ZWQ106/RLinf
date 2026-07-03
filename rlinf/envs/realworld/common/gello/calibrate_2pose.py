@@ -49,10 +49,14 @@ PORT = "/dev/gello"
 BAUD = 57600
 IDS = [1, 2, 3, 4, 5, 6, 7]
 _PI2 = np.pi / 2
-# Pose A = the DROID home anchor. Pose B moves every joint ~0.3-0.4 rad (within
-# FR3 limits, arm stays up) so each joint has a clear slope to solve.
+# Pose A = the DROID home anchor. Pose B moves every joint far enough that its
+# slope (hence sign) is unambiguous despite operator matching error. The ROLL
+# joints (J1/J3/J5/J7) get LARGE deltas (~0.9 rad) — base/wrist rotation is hard
+# to match by eye, and a too-small delta is exactly what flipped J1's sign. Pitch
+# joints (J2/J4/J6) stay moderate (they carry load / are nearer the table). All
+# within FR3 limits, arm stays up.
 POSE_A = [0.0, -0.6283, 0.0, -2.5133, 0.0, 1.8850, 0.0]
-POSE_B = [0.40, -0.35, 0.40, -2.20, 0.40, 1.50, 0.40]
+POSE_B = [1.00, -0.15, 0.90, -2.00, 0.90, 1.30, 0.90]
 MATCH_SECONDS = 25
 VERIFY_TOL = 0.30
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "fr3_gello_config.py")
@@ -108,6 +112,10 @@ def calibrate(driver, robot):
     rawA, robA = _capture(driver, robot, "POSE A (home)", POSE_A)
     rawB, robB = _capture(driver, robot, "POSE B", POSE_B)
     draw, drob = rawA - rawB, robA - robB
+    # Unwrap the raw difference into [-pi, pi] — the true per-joint delta is < pi,
+    # so a larger |draw| means the servo angle wrapped; fold it back so the slope
+    # sign is correct.
+    draw = (draw + np.pi) % (2 * np.pi) - np.pi
     offs, signs, oks = [], [], []
     print("\n========== SOLVE ==========")
     print(f"{'J':>3} {'sign':>5} {'off(pi/2)':>10} {'resid':>7} {'slope':>7}  quality")
