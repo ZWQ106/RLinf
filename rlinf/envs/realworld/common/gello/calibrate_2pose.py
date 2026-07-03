@@ -88,11 +88,11 @@ def _capture(driver, robot, label, pose):
 def main():
     from gello.dynamixel.driver import DynamixelDriver
 
-    from rlinf.envs.realworld.franka.droid_zerorpc_client import DroidClient
+    from rlinf.envs.realworld.franka.droid_zerorpc_client import DroidZerorpcClient
 
     print("connecting to leader (/dev/gello) + robot…", flush=True)
     driver = DynamixelDriver(IDS, port=PORT, baudrate=BAUD)
-    robot = DroidClient(address=ROBOT_ADDR)
+    robot = DroidZerorpcClient(address=ROBOT_ADDR)
     try:
         robot.get_robot_state()  # fail fast if controller not live
     except Exception as e:
