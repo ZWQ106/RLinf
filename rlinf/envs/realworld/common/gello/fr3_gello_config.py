@@ -37,8 +37,11 @@ import numpy as np
 FR3_GELLO_PORT = "/dev/gello"
 
 _PI_2 = np.pi / 2
-# joint_offsets expressed in pi/2 units (the calibration resolution).
-FR3_GELLO_OFFSETS_PI_2 = (2, 0, 0, 2, 2, 1, 2)
+# joint_offsets expressed in pi/2 units (the calibration resolution). The pitch
+# joints (J2/J4/J6) were corrected 2026-07-03 against the homed robot (a rigid
+# reference — free-space holding couldn't resolve them): J2 0->-1, J4 2->1,
+# J6 1->0. A wrong offset reads ~90 deg off even when the leader looks matched.
+FR3_GELLO_OFFSETS_PI_2 = (2, -1, 0, 1, 2, 0, 2)
 FR3_GELLO_JOINT_SIGNS = (1, -1, 1, -1, 1, 1, 1)
 # (gripper servo id, open position deg, closed position deg).
 FR3_GELLO_GRIPPER_CONFIG = (8, 264, 222)
