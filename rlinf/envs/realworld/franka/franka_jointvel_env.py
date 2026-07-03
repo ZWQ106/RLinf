@@ -25,6 +25,8 @@ import time
 import gymnasium as gym
 import numpy as np
 
+from rlinf.envs.realworld.common.step_timing import timed as _timed
+from rlinf.envs.realworld.common.step_timing import tick as _timing_tick
 from rlinf.envs.realworld.franka.franka_env import FrankaEnv
 
 
@@ -80,13 +82,16 @@ class FrankaJointVelEnv(FrankaEnv):
             # joint read is now served from this cached state) -> 3 controller
             # RPCs/step down to 1, steadying the command cadence. The no-op
             # _clear_error() RPC is dropped (polymetis impedance self-recovers).
-            self._franka_state = self._controller.step_joint_velocity(
-                action.astype(np.float32)
-            ).wait()[0]
+            with _timed("controller_rpc"):
+                self._franka_state = self._controller.step_joint_velocity(
+                    action.astype(np.float32)
+                ).wait()[0]
         self._num_steps += 1
         step_time = time.time() - start_time
         time.sleep(max(0, (1.0 / self.config.step_frequency) - step_time))
-        observation = self._get_observation()
+        with _timed("camera_grab"):
+            observation = self._get_observation()
+        _timing_tick()
         reward = self._calc_step_reward(observation, is_ee_action_effective)
         terminated = (reward == 1.0) and (
             self._success_hold_counter >= self.config.success_hold_steps

@@ -69,7 +69,10 @@ class GelloJointIntervention(gym.ActionWrapper):
         self.last_intervene = 0.0
 
     def action(self, action: np.ndarray):
-        gello_joints, gello_gripper = self.agent.get_action()
+        from rlinf.envs.realworld.common.step_timing import timed as _timed
+
+        with _timed("gello_read"):
+            gello_joints, gello_gripper = self.agent.get_action()
         q_gello = np.asarray(gello_joints, dtype=np.float64).reshape(-1)[:7]
         q_robot = np.asarray(
             self.get_wrapper_attr("get_arm_joint_position")(), dtype=np.float64
