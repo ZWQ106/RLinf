@@ -168,7 +168,7 @@ present; the dashboard runs under sudo to access it.
   them from source (PyPI + `wuphilipp/gello_software` + `RLinf/gello-teleop`) when
   missing, so a container rebuild self-heals. The GELLO leader **calibration** lives
   in the repo at `rlinf/envs/realworld/common/gello/fr3_gello_config.py` (injected
-  into gello's `PORT_CONFIG_MAP` at runtime) — see [TELEOP.md](TELEOP.md#gello-calibration).
+  into gello's `PORT_CONFIG_MAP` at runtime) — see [TELEOP.md](TELEOP.md#8-gello-calibration).
 - In-container Python: `/opt/venv/openpi/bin/python`. The collection run is
   `examples/embodiment/collect_real_data.py` from the mounted `~/RLinf` checkout.
 

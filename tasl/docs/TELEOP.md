@@ -144,8 +144,8 @@ Two different things:
 | Huge `ray::… "" "" …` zombie dump on Stop | Ray reporting already-dead (zombie) procs it can't re-kill | Harmless — ignore. They clear on the next `rlinf-eval` restart. |
 | NUC1 unreachable in Stage 1 | Robot net down / NUC off | `ping 172.16.0.2`; check the cable/switch and that NUC1 is powered. |
 | `/dev/gello` missing | GELLO unplugged or udev rule not applied | Replug; check `ls /dev/serial/by-id/`. |
-| `AssertionError: Port /dev/gello not in config map` | GELLO leader calibration not registered (e.g. after a container rebuild that dropped the deps) | The calibration is in-repo (`fr3_gello_config.py`) and injected by `gello_joint_intervention`; ensure the GELLO deps are installed (`ensure_container_deps` / re-run `teleop.sh`). See [GELLO calibration](#gello-calibration). |
-| One joint lurches ~90° on the first teleop tick | That joint's GELLO offset is wrong by π/2 | Flip that joint's entry in `FR3_GELLO_OFFSETS_PI_2` (`fr3_gello_config.py`) and re-verify. See [GELLO calibration](#gello-calibration). |
+| `AssertionError: Port /dev/gello not in config map` | GELLO leader calibration not registered (e.g. after a container rebuild that dropped the deps) | The calibration is in-repo (`fr3_gello_config.py`) and injected by `gello_joint_intervention`; ensure the GELLO deps are installed (`ensure_container_deps` / re-run `teleop.sh`). See [GELLO calibration](#8-gello-calibration). |
+| One joint lurches ~90° on the first teleop tick | That joint's GELLO offset is wrong by π/2 | Flip that joint's entry in `FR3_GELLO_OFFSETS_PI_2` (`fr3_gello_config.py`) and re-verify. See [GELLO calibration](#8-gello-calibration). |
 
 **FCI exclusivity (root cause of most controller hangs):** only one FCI client at
 a time. The franky `robot_server` (systemd `franka-robot-server`) must be
@@ -168,27 +168,42 @@ kept **in the repo** and injected into gello's `PORT_CONFIG_MAP` at runtime:
   before the agent opens the port. Keeping it in-repo (not hand-edited into the
   ephemeral `gello_software` install) is why it survives a container rebuild.
 
-**Re-calibrate** when the leader is re-assembled, or if the config is ever lost.
-Offsets snap to π/2, so you only need the leader within ±45° of the start pose.
+### Re-calibrate — one command
 
-1. **Raw offsets** — hold the leader at `START = [0,0,0,-1.571,0,1.571,0]`, gripper
-   fully **open**, and run:
-   ```bash
-   docker exec rlinf-eval /opt/venv/openpi/bin/python \
-     /opt/gello_software/scripts/gello_get_offset.py \
-     --port /dev/gello --start-joints 0 0 0 -1.571 0 1.571 0 \
-     --joint-signs 1 -1 1 -1 1 1 1 --gripper
-   ```
-   Read `best offsets function of pi` (the `N*np.pi/2` list) and the gripper
-   open/close degrees. Base joints are hard to hold steady — expect a couple of
-   joints to be ambiguous across runs.
-2. **Validate per joint** — put the candidate offsets into `fr3_gello_config.py`,
-   then confirm each joint independently against the homed **robot** (a rigid
-   reference, far better than holding in air): with the arm at the home pose, hold
-   the leader to match and check that each `q_gello − q_robot` is small. Any joint
-   stuck near ±π/2 → its offset is wrong by one step; adjust that entry.
-3. Current values were re-derived **2026-07-03**: offsets `[2,0,0,2,2,1,2]`, signs
-   `[1,-1,1,-1,1,1,1]`, gripper `(8,264,222)`.
+Re-calibrate when the leader is re-assembled or the config is lost. With the
+controller live and the arm homed (`teleop.sh`, **don't press Start**), run:
+
+```bash
+~/RLinf/tasl/launch/gello-calibrate.sh            # 2-pose calibrate → write config → verify
+~/RLinf/tasl/launch/gello-calibrate.sh --verify   # re-check the current config vs the robot
+~/RLinf/tasl/launch/gello-calibrate.sh --no-write  # calibrate + print only
+```
+
+It reaps stale port holders, drives the arm to **two poses** (speed-bounded — hand
+on the E-stop), you match the leader at each, then it solves **both sign and
+offset**, writes them into `fr3_gello_config.py`, re-homes, and verifies. No
+copy-paste.
+
+**Why two poses (not one):** per joint `q = sign·(raw − offset)` is one equation
+with two unknowns; the **sign is the slope**, unobservable from a single static
+pose — so a one-pose check can set the offset only if the sign is already known,
+and silently passes a wrong sign that then runs away in teleop. Two poses measure
+the slope directly: `sign = Δrobot/Δraw`, `offset = raw − sign·robot` (snap π/2).
+
+**Tips for a clean solve:**
+- **Soften the arm first** so a collision during the moves is harmless — tune
+  joint stiffness with `controller/deploy.sh --kq "…"` (lower = softer; gravity is
+  compensated so it still holds pose). See [controller/README](../controller/README.md).
+- Match the **roll joints** (J1/J3/J5/J7) carefully — base/wrist *rotation* is hard
+  to judge by eye and is the usual culprit for a flipped sign (the tool uses large
+  roll deltas to make it obvious). A joint reading `~±1.5` in verify = wrong
+  sign/offset; `~0.3–0.6` = wrist/holding wobble (fine).
+- Sign-only fix: if just one joint runs backwards, flip its entry in
+  `FR3_GELLO_JOINT_SIGNS` (for joints whose home value is 0, the offset stays
+  valid — only the direction changes).
+
+Current values (2026-07-03, two-pose): offsets `(2,0,0,1,2,3,2)`, signs
+`(1,1,1,-1,1,-1,1)`, gripper `(8,264,222)`.
 
 > Note: the calibration is **not** in the base image or in `gello_software` — only
 > in `fr3_gello_config.py`. Do not hand-edit `PORT_CONFIG_MAP` in the container; it
