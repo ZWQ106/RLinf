@@ -531,7 +531,14 @@ class RecordVideo(gym.Wrapper):
         return result
 
     def flush_video(self, video_sub_dir: Optional[str] = None):
-        """Write buffered frames to an MP4 file (async)."""
+        """Write buffered frames to a fully-finalized MP4 file.
+
+        Encodes on the background executor but BLOCKS until the write completes,
+        so the file's moov atom is written before we return. flush_video is
+        called at episode/rollout boundaries, so this added wait does not stall
+        env stepping — and it guarantees a playable file even if the process is
+        killed immediately afterwards (e.g. dashboard "Stop server" -> pkill -9,
+        which previously left an unfinalized, unplayable MP4)."""
         if not self.render_images:
             return
 
@@ -546,13 +553,18 @@ class RecordVideo(gym.Wrapper):
         frames = list(self.render_images)
         self.render_images = []
         self.video_cnt += 1
-        self._submit_save(frames, mp4_path)
+        future = self._submit_save(frames, mp4_path)
+        try:
+            future.result()  # block until the MP4 is fully written + finalized
+        except Exception as exc:
+            warnings.warn(f"Video save did not finalize {mp4_path}: {exc}")
 
-    def _submit_save(self, frames: list[np.ndarray], mp4_path: str) -> None:
-        """Submit a background job to save the video."""
+    def _submit_save(self, frames: list[np.ndarray], mp4_path: str) -> "Future":
+        """Submit a background job to save the video; return its Future."""
         self._prune_futures()
         future = self._executor.submit(self._save_video, frames, mp4_path)
         self._save_futures.append(future)
+        return future
 
     def _normalize_frames(self, frames: list[np.ndarray]) -> list[np.ndarray]:
         """Coerce all frames to one constant, even (H, W), 3-channel uint8.
