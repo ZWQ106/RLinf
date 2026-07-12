@@ -234,10 +234,12 @@ class CamManager:
             return self._latest_jpeg.get(name)
 
     def get_policy_view_jpeg(self, name: str, size: int = 224) -> Optional[bytes]:
-        """Return the exact frame the policy would see: square center-crop + resize.
+        """Return the exact frame the policy would see: letterbox pad + resize.
 
-        Mirrors FrankaJointVelEnv._center_crop_resize so the policy view is
-        WYSIWYG with what RLinf's EnvWorker feeds the model.
+        Mirrors FrankaEnv's image_resize_mode: "pad" (the DROID-correct
+        preprocessing) so the policy view is WYSIWYG with what RLinf's EnvWorker
+        feeds the model — the full undistorted FOV squared with black bars, NOT
+        a centre crop. Keep in sync with FrankaEnv._pad_to_square.
         """
         with self._frame_lock:
             jpeg = self._latest_jpeg.get(name)
@@ -246,11 +248,14 @@ class CamManager:
         try:
             arr = np.asarray(Image.open(io.BytesIO(jpeg)).convert("RGB"))
             h, w = arr.shape[:2]
-            side = min(h, w)
-            sy = (h - side) // 2
-            sx = (w - side) // 2
-            crop = arr[sy:sy + side, sx:sx + side]
-            small = cv2.resize(crop, (size, size), interpolation=cv2.INTER_AREA)
+            # Letterbox to a centered square (full FOV preserved), matching the
+            # env's pad path; a centre crop here would misrepresent the input.
+            sq = max(h, w)
+            pad_t = (sq - h) // 2
+            pad_l = (sq - w) // 2
+            square = np.zeros((sq, sq, 3), dtype=arr.dtype)
+            square[pad_t:pad_t + h, pad_l:pad_l + w] = arr
+            small = cv2.resize(square, (size, size), interpolation=cv2.INTER_AREA)
             buf = io.BytesIO()
             Image.fromarray(small).save(buf, format="JPEG", quality=self.jpeg_quality)
             return buf.getvalue()
@@ -933,7 +938,7 @@ INDEX_HTML = """<!doctype html>
 </div>
 <div class="row" style="margin-top:8px">
   <div class="col cam" style="flex:0 1 auto">
-    <div class="label">policy view — exterior (224×224 center-crop)</div>
+    <div class="label">policy view — exterior (224×224 pad)</div>
     <img src="/cam/wrist_1_policy.mjpg" alt="exterior policy"
          style="width:224px;height:224px;image-rendering:pixelated"/>
   </div>
