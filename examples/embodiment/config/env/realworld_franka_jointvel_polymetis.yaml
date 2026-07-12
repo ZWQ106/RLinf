@@ -55,9 +55,18 @@ override_cfg:
     - "36443134"
     - "17150101"
 
-  # ZED capture resolution for the raw per-episode SVO (obs still center-crops
-  # to 128). HD1080 confirmed feasible @15Hz for both cams (0 drops).
+  # ZED capture resolution for the raw per-episode SVO. HD1080 confirmed
+  # feasible @15Hz for both cams (0 drops).
   camera_resolution: [1280, 720]
+
+  # DROID-correct image preprocessing for zero-shot pi05_droid eval:
+  #   image_resize_mode: pad  -> letterbox to square, preserving the FULL FOV
+  #     (matches openpi's tf.image.resize_with_pad). A centre crop (the
+  #     collection default) drops ~44% of the ZED width and wrecks the policy.
+  #   obs_image_size: 224     -> feed the model's native size directly, so
+  #     openpi's internal resize_with_pad is a no-op (no lossy 128->224 step).
+  image_resize_mode: pad
+  obs_image_size: 224
 
   # Reset/home joint pose: DROID home [q1..q7] in radians.
   joint_reset_qpos: [0.0, -0.6283, 0.0, -2.5133, 0.0, 1.8850, 0.0]

@@ -63,6 +63,15 @@ class FrankaRobotConfig:
     # pi0/pi05 resize to 224 internally; 224 is the no-loss/no-waste default.
     # Default 128 preserves the existing eval-path behavior.
     obs_image_size: int = 128
+    # How a rectangular camera frame is made square for the obs:
+    #   "crop" (default): centre-square crop -> ZOOMS IN, DISCARDS the sides.
+    #   "pad": letterbox with black bars -> preserves the FULL, undistorted FOV.
+    # DROID-trained policies (pi0/pi05_droid) preprocess with tf.image.
+    # resize_with_pad (openpi image_tools.resize_with_pad), so zero-shot DROID
+    # eval MUST use "pad" — a centre crop drops ~44% of a 1280x720 ZED's width
+    # and shifts object scale/position out of the training distribution.
+    # "crop" stays the default for the square data-collection convention.
+    image_resize_mode: str = "crop"
 
     is_dummy: bool = False
     use_dense_reward: bool = False
@@ -177,6 +186,11 @@ class FrankaEnv(gym.Env):
         # pi0/pi05 resize to 224 internally; 224 is the no-loss/no-waste default.
         # Configurable; default 128 preserves the existing eval-path behavior.
         self._obs_image_size = int(getattr(config, "obs_image_size", 128))
+        # "crop" (centre-square) or "pad" (letterbox, full FOV). DROID eval
+        # needs "pad" to match openpi's resize_with_pad preprocessing.
+        self._image_resize_mode = str(
+            getattr(config, "image_resize_mode", "crop")
+        ).lower()
         self.hardware_info = hardware_info
         self.env_idx = env_idx
         self.node_rank = 0
@@ -787,6 +801,14 @@ class FrankaEnv(gym.Env):
             y2 = int(h * bottom_pct)
             x2 = int(w * right_pct)
             cropped_frame = frame[y1:y2, x1:x2]
+        elif getattr(self, "_image_resize_mode", "crop") == "pad":
+            # Letterbox to a square, preserving the FULL undistorted FOV — the
+            # numpy/cv2 equivalent of openpi's image_tools.resize_with_pad, which
+            # is how DROID-trained policies (pi0/pi05_droid) preprocess. A centre
+            # crop (below) would zoom in and drop the sides, shifting the scene
+            # out of the training distribution. cropped_frame is the pre-resize
+            # square (returned for the display/full views).
+            cropped_frame = self._pad_to_square(frame)
         else:
             crop_size = min(h, w)
             start_x = (w - crop_size) // 2
@@ -796,6 +818,29 @@ class FrankaEnv(gym.Env):
             ]
         resized_frame = cv2.resize(cropped_frame, reshape_size)
         return cropped_frame, resized_frame
+
+    @staticmethod
+    def _pad_to_square(frame: np.ndarray) -> np.ndarray:
+        """Pad a frame with black to a centered square (no distortion, no crop).
+
+        Mirrors tf.image.resize_with_pad's padding step: the longer side sets
+        the square size and the shorter side is centered with equal black bars.
+        The full field of view is preserved."""
+        h, w = frame.shape[:2]
+        side = max(h, w)
+        pad_top = (side - h) // 2
+        pad_bottom = side - h - pad_top
+        pad_left = (side - w) // 2
+        pad_right = side - w - pad_left
+        return cv2.copyMakeBorder(
+            frame,
+            pad_top,
+            pad_bottom,
+            pad_left,
+            pad_right,
+            cv2.BORDER_CONSTANT,
+            value=(0, 0, 0),
+        )
 
     def _get_camera_frames(self) -> dict[str, np.ndarray]:
         """Get frames from all cameras."""
