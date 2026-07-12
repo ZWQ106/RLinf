@@ -17,8 +17,21 @@ gello_vmax: 1.0
 main_image_key: wrist_1
 
 video_cfg:
-  save_video: False
+  # Record an MP4 per eval episode showing BOTH cameras (exterior | wrist)
+  # tiled side-by-side. Frames are the 128² policy-view crops; one panel per
+  # camera. Lands under video_base_dir/seed_<seed>/<n>.mp4 (host-visible via
+  # the bind-mounted repo). RecordVideo wraps the env when save_video is True.
+  save_video: True
   info_on_video: True
+  # The Franka env stores obs frames as BGR — convert to RGB so the MP4 colors
+  # are correct (RecordVideo only tiles the "frames" dict when this is set).
+  frames_bgr: True
+  # Control/streaming rate of the joint-velocity rollout (chunk loop @ 15 Hz).
+  fps: 15
+  # Upscale the recorded frame to this height (px, aspect preserved) for a
+  # viewable MP4 — source frames are the 128² policy-view crops, so this
+  # enlarges for viewing, not extra detail. Two 128² cams tiled -> 720x1440.
+  video_height: 720
   video_base_dir: ${runner.logger.log_path}/video/eval
 
 init_params:

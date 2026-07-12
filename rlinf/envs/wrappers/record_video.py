@@ -113,13 +113,104 @@ class RecordVideo(gym.Wrapper):
             return value
         return np.array(value)
 
+    def _combine_multiview(self, obs: Any) -> Optional[np.ndarray]:
+        """Tile main_images + extra_view_images into one wide frame per env.
+
+        RealWorldEnv._wrap_obs emits main_images (E, H, W, 3) and, when there is
+        more than one camera, extra_view_images (E, K, H, W, 3). Concatenate them
+        along width so the recorded frame shows [main | extra_0 | extra_1 ...].
+        Returns None when the obs is not this multi-camera layout (single camera
+        or a different obs shape) so the caller falls back to its normal keys.
+        ``video_cfg.frames_bgr`` converts BGR->RGB (the real env stores BGR).
+        """
+        if not isinstance(obs, dict):
+            return None
+        main = obs.get("main_images")
+        extra = obs.get("extra_view_images")
+        if main is None or extra is None:
+            return None
+        main = self._to_numpy(main)
+        extra = self._to_numpy(extra)
+        if main.ndim == 3:  # (H, W, 3) -> add env axis
+            main = main[None]
+        if extra.ndim == 4:  # (K, H, W, 3) -> add env axis
+            extra = extra[None]
+        if main.ndim != 4 or extra.ndim != 5:
+            return None  # unexpected layout; let the normal path handle it
+        views = [main] + [extra[:, k] for k in range(extra.shape[1])]  # each (E,H,W,3)
+        try:
+            combined = np.concatenate(views, axis=2)  # tile along width
+        except ValueError:
+            return None  # mismatched sizes; don't crash recording
+        if combined.dtype != np.uint8:
+            combined = combined.astype(np.uint8)
+        if self.video_cfg.get("frames_bgr", False) and combined.shape[-1] == 3:
+            combined = combined[..., ::-1]
+        return np.ascontiguousarray(combined)
+
+    def _maybe_upscale(self, img: np.ndarray) -> np.ndarray:
+        """Resize a frame up to ``video_cfg.video_height`` px tall (aspect
+        preserved), for a larger, more viewable MP4. No-op when unset or the
+        frame is already at least that tall. Source frames are small policy-view
+        crops, so this is an upscale for viewing, not added detail."""
+        target_h = self.video_cfg.get("video_height", None)
+        if not target_h:
+            return img
+        if not isinstance(img, np.ndarray) or img.ndim < 2:
+            return img
+        h, w = img.shape[:2]
+        target_h = int(target_h)
+        if h <= 0 or h >= target_h:
+            return img
+        new_w = max(1, int(round(w * target_h / h)))
+        try:
+            import cv2
+
+            return cv2.resize(img, (new_w, target_h), interpolation=cv2.INTER_LINEAR)
+        except Exception:
+            # Integer nearest-neighbour fallback if cv2 is unavailable.
+            fy = max(1, target_h // h)
+            fx = max(1, new_w // w)
+            return np.repeat(np.repeat(img, fy, axis=0), fx, axis=1)
+
     def _get_image_from_dict(self, obs: dict) -> Optional[Any]:
         """Pick the best image field from an observation dict."""
         if hasattr(self.env, "capture_image"):
             return self.env.capture_image()
+        # Real-robot multi-camera obs (RealWorldEnv._wrap_obs) splits cameras
+        # into main_images (the policy's main view) + extra_view_images (the
+        # rest). Tile ALL of them so the video shows every camera (e.g.
+        # exterior | wrist), not just the main one. Falls through to the
+        # single-image keys below when there is only one camera.
+        multiview = self._combine_multiview(obs)
+        if multiview is not None:
+            return multiview
         for key in ("main_images", "images", "rgb", "full_image", "main_image"):
             if key in obs and obs[key] is not None:
                 return obs[key]
+        # Real-robot envs (e.g. Franka) expose per-camera images under a
+        # ``frames`` dict {camera_name: HxWx3} rather than one of the keys
+        # above. Tile every camera into a single panel so the recorded video
+        # shows ALL views (e.g. exterior | wrist), not just the policy's main
+        # image. ``video_cfg.frames_bgr`` converts BGR->RGB (the Franka env
+        # stores BGR) so colors are correct in the MP4. Sorted names give a
+        # stable left-to-right order (wrist_1 then wrist_2).
+        frames = obs.get("frames") if isinstance(obs, dict) else None
+        if isinstance(frames, dict) and frames:
+            bgr = bool(self.video_cfg.get("frames_bgr", False))
+            imgs: list[np.ndarray] = []
+            for name in sorted(frames):
+                img = frames[name]
+                if img is None:
+                    continue
+                img = self._to_numpy(img)
+                if img.dtype != np.uint8:
+                    img = img.astype(np.uint8)
+                if bgr and img.ndim == 3 and img.shape[-1] == 3:
+                    img = img[..., ::-1]
+                imgs.append(np.ascontiguousarray(img))
+            if imgs:
+                return imgs[0] if len(imgs) == 1 else tile_images(imgs, nrows=1)
         return None
 
     def _extract_frame_batches(self, obs: Any) -> list[list[np.ndarray]]:
@@ -314,6 +405,10 @@ class RecordVideo(gym.Wrapper):
         """Overlay info (optional) and append a tiled frame."""
         if not images:
             return
+        # Upscale BEFORE the info overlay so the reward/termination text is
+        # drawn crisp at the final resolution (the source frames are the small
+        # policy-view crops, e.g. 128²).
+        images = [self._maybe_upscale(img) for img in images]
         if self.video_cfg.get("info_on_video", True):
             images = [
                 put_info_on_image(

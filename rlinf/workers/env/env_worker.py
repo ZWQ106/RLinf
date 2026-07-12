@@ -15,7 +15,7 @@
 import asyncio
 import gc
 from collections import defaultdict
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
 import numpy as np
 import torch
@@ -302,6 +302,22 @@ class EnvWorker(Worker):
                 )
             env_list.append(env)
         return env_list
+
+    @staticmethod
+    def _unwrap_record_video(env) -> Optional["RecordVideo"]:
+        """Find the RecordVideo wrapper anywhere in the wrapper chain.
+
+        RecordVideo is applied BEFORE data-collection/other wrappers (see
+        _setup_env_and_wrappers), so the outermost env is not RecordVideo when
+        data_collection is enabled. Flushing must therefore search the chain via
+        the ``.env`` links rather than isinstance-checking the top wrapper — else
+        videos are silently never written (observed in real-robot eval, where
+        CollectEpisode wraps RecordVideo)."""
+        while env is not None:
+            if isinstance(env, RecordVideo):
+                return env
+            env = getattr(env, "env", None)
+        return None
 
     def _setup_dst_rank_map(self) -> dict[str, list[tuple[int, int]]]:
         """Compute destination rank map for this env worker.
@@ -744,17 +760,15 @@ class EnvWorker(Worker):
         # reset
         if mode == "train":
             for i in range(self.stage_num):
-                if self.cfg.env.train.video_cfg.save_video and isinstance(
-                    self.env_list[i], RecordVideo
-                ):
-                    self.env_list[i].flush_video()
+                rv = self._unwrap_record_video(self.env_list[i])
+                if self.cfg.env.train.video_cfg.save_video and rv is not None:
+                    rv.flush_video()
                 self.env_list[i].update_reset_state_ids()
         elif mode == "eval":
             for i in range(self.stage_num):
-                if self.cfg.env.eval.video_cfg.save_video and isinstance(
-                    self.eval_env_list[i], RecordVideo
-                ):
-                    self.eval_env_list[i].flush_video()
+                rv = self._unwrap_record_video(self.eval_env_list[i])
+                if self.cfg.env.eval.video_cfg.save_video and rv is not None:
+                    rv.flush_video()
                 if not self.cfg.env.eval.auto_reset:
                     self.eval_env_list[i].update_reset_state_ids()
 
