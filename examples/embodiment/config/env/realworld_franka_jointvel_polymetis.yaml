@@ -23,9 +23,11 @@ video_cfg:
   # the bind-mounted repo). RecordVideo wraps the env when save_video is True.
   save_video: True
   info_on_video: True
-  # The Franka env stores obs frames as BGR — convert to RGB so the MP4 colors
-  # are correct (RecordVideo only tiles the "frames" dict when this is set).
-  frames_bgr: True
+  # Obs frames are already RGB — _get_camera_frames reverses the ZED's BGR
+  # (retrieve_image gives BGRA -> [:, :, :3] = BGR, then [..., ::-1] -> RGB),
+  # which is also what the policy consumes. imageio writes RGB, so the recorder
+  # must NOT swap again; keep this False (a swap here produced BGR-looking MP4s).
+  frames_bgr: False
   # Control/streaming rate of the joint-velocity rollout (chunk loop @ 15 Hz).
   fps: 15
   # Upscale the recorded frame to this height (px, aspect preserved) for a
