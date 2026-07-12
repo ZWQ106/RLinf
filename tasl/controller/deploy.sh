@@ -4,10 +4,16 @@
 # gains, safety limits, IPs). RUN ON THE DESKTOP.
 #
 #   ./deploy.sh                       # push conf -> NUC1, restart controller, wait :4242
-#   ./deploy.sh --kq "20 15 25 12 18 12 5"   # set joint stiffness first, then deploy
+#   ./deploy.sh --preset stiff        # named joint-stiffness preset (see PRESETS below)
+#   ./deploy.sh --kq "20 15 25 12 18 12 5"   # custom 7-joint stiffness, then deploy
 #   ./deploy.sh --no-restart          # copy files only (apply later)
 #   NUC1_HOST=… ./deploy.sh           # override the NUC host
 #   LAUNCH_DRY_RUN=1 ./deploy.sh      # print actions, do nothing
+#
+# PRESETS (default_Kq, J1..J7) — pick with --preset NAME:
+#   stiff   [40 30 50 25 35 25 10]  original — accurate tracking (data collection + policy eval)
+#   soft    [20 15 25 12 18 12  5]  halved  — compliant, still decent tracking
+#   softer  [15 12 20 10 12  8  4]  current — most compliant (GELLO calibration / teleop testing)
 #
 # The config files are mounted into the container (see docker-compose.yaml), so a
 # restart re-reads them. A restart drops FCI: afterwards re-Activate FCI in Desk
@@ -20,17 +26,35 @@ source "$_DIR/../launch/lib.sh"   # NUC1_SSH/HOST, ZERORPC_ADDR, step/ok/warn/di
 
 RESTART=1
 KQ=""
+PRESET=""
 NUC_DIR="${NUC_CONTROLLER_DIR:-polymetis_fr3}"   # ~/polymetis_fr3 on NUC1
 HW_YAML="$_DIR/conf/franka_hardware.yaml"
+
+# Named default_Kq presets (J1..J7). Source of truth for --preset; keep the
+# --help header table above in sync. Promote a good hand-tuned vector here.
+declare -A KQ_PRESETS=(
+  [stiff]="40 30 50 25 35 25 10"    # original — accurate tracking (collection + eval)
+  [soft]="20 15 25 12 18 12 5"      # halved  — compliant, still decent tracking
+  [softer]="15 12 20 10 12 8 4"     # current — most compliant (GELLO calib / teleop)
+)
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --no-restart) RESTART=0; shift ;;
     --kq) KQ="${2:-}"; shift 2 ;;
-    -h|--help) sed -n '2,17p' "$0"; exit 0 ;;
+    --preset) PRESET="${2:-}"; shift 2 ;;
+    -h|--help) sed -n '2,21p' "$0"; exit 0 ;;
     *) die "unknown arg: $1 (see --help)" ;;
   esac
 done
+
+# Resolve a named preset into KQ (mutually exclusive with --kq).
+if [[ -n "$PRESET" ]]; then
+  [[ -n "$KQ" ]] && die "use either --preset or --kq, not both"
+  KQ="${KQ_PRESETS[$PRESET]:-}"
+  [[ -n "$KQ" ]] || die "unknown --preset '$PRESET' (choices: ${!KQ_PRESETS[*]})"
+  ok "preset '$PRESET' -> default_Kq [$KQ]"
+fi
 
 # --- optional: set joint stiffness in the repo config before deploying --------
 if [[ -n "$KQ" ]]; then

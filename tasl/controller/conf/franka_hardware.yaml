@@ -12,7 +12,7 @@ robot_client:
     # still holds pose); keeping Kqd -> overdamped, stable. Tune with
     # `controller/deploy.sh --kq "…"`. Original (stiffer) tracking values:
     # Kq [40, 30, 50, 25, 35, 25, 10]. Lower = softer.
-    default_Kq: [15, 12, 20, 10, 12, 8, 4]
+    default_Kq: [40, 30, 50, 25, 35, 25, 10]
     default_Kqd: [4, 6, 5, 5, 3, 2, 1]
     default_Kx: [400, 400, 400, 15, 15, 15]
     default_Kxd: [37, 37, 37, 2, 2, 2]
