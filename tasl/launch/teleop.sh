@@ -78,7 +78,7 @@ ensure_rlinf_container
 step "  mutual exclusion: stop the other dashboard"
 kill_other_dashboard collect
 step "  cameras: both ZEDs free ($ZED_EXTERIOR exterior, $ZED_WRIST wrist)"
-zeds_free || die "ZEDs not both free/present — reseat the exterior 2i USB; ensure no dashboard/collection holds them."
+zeds_free || die "ZEDs not both visible to the SDK. If no dashboard/collection holds them, it's usually a post-hot-plug USB wedge — run: $_DIR/zed-check.sh --reset  (then re-run). See zed-check.sh for escalation."
 step "  reap stale collection procs in rlinf-eval"
 desk "docker exec rlinf-eval bash -lc 'pkill -9 -f \"[r]ay::DataCollector\"; pkill -9 -f \"[c]ollect_real_data\"; pkill -9 -f \"[P]olymetisController\"; /opt/venv/openpi/bin/ray stop --force 2>/dev/null; rm -rf /tmp/ray; true'"
 step "  stop any existing collect dashboard (idempotent)"
