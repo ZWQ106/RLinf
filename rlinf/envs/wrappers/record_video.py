@@ -14,12 +14,12 @@
 
 import numbers
 import os
+import subprocess
 import warnings
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Optional
 
 import gymnasium as gym
-import imageio
 import numpy as np
 
 try:
@@ -555,7 +555,10 @@ class RecordVideo(gym.Wrapper):
         self.video_cnt += 1
         future = self._submit_save(frames, mp4_path)
         try:
-            future.result()  # block until the MP4 is fully written + finalized
+            # Block until the MP4 is fully written + finalized (moov atom), but
+            # bound it: video finalization must never wedge the eval loop (a
+            # hung encoder previously left the gated runner stuck in BUSY).
+            future.result(timeout=180)
         except Exception as exc:
             warnings.warn(f"Video save did not finalize {mp4_path}: {exc}")
 
@@ -598,30 +601,54 @@ class RecordVideo(gym.Wrapper):
         return out
 
     def _save_video(self, frames: list[np.ndarray], mp4_path: str) -> None:
-        """Save frames to disk (runs in background) as H.264 (libx264)."""
+        """Save frames to disk (runs in background) as H.264 (libx264).
+
+        Two-step, fully decoupled from a live ffmpeg pipe: dump the raw frames
+        to a temp file, then batch-encode with a one-shot ffmpeg subprocess.
+        A *live* stdin pipe to ffmpeg is unreliable inside the multi-threaded
+        Ray env worker: with the encoder niced and the GIL contended, the pipe
+        stalls -> the encoder starves and never finalizes, wedging the whole
+        gated eval loop in BUSY (observed 2026-07-12, twice). Reading a complete
+        file has no producer/consumer coupling, so it cannot stall; stderr/stdout
+        go to DEVNULL and -preset ultrafast keeps the encode well under the
+        timeout even when niced. libx264 + yuv420p keeps a broadly-playable MP4."""
         frames = self._normalize_frames(frames)
         if not frames:
             return
-        video_writer = None
+        h, w = frames[0].shape[:2]
         try:
-            # Explicit libx264 + yuv420p for a broadly compatible, playable MP4;
-            # macro_block_size=1 keeps the exact (already-even) dimensions
-            # instead of padding to a multiple of 16.
-            video_writer = imageio.get_writer(
-                mp4_path,
-                fps=self._fps,
-                codec="libx264",
-                pixelformat="yuv420p",
-                macro_block_size=1,
-                output_params=["-crf", "20", "-preset", "medium"],
+            import imageio_ffmpeg
+
+            ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:
+            ffmpeg_exe = "ffmpeg"
+        raw_path = mp4_path + ".raw"
+        cmd = [
+            ffmpeg_exe, "-y",
+            "-f", "rawvideo", "-pix_fmt", "rgb24",
+            "-s", f"{w}x{h}", "-r", str(self._fps),
+            "-i", raw_path, "-an",
+            "-vcodec", "libx264", "-pix_fmt", "yuv420p",
+            "-crf", "23", "-preset", "ultrafast",
+            mp4_path,
+        ]
+        try:
+            with open(raw_path, "wb") as raw:
+                for img in frames:
+                    raw.write(np.ascontiguousarray(img).tobytes())
+            subprocess.run(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=120,
             )
-            for img in frames:
-                video_writer.append_data(img)
         except Exception as exc:
             warnings.warn(f"Failed to save video {mp4_path}: {exc}")
         finally:
-            if video_writer is not None:
-                video_writer.close()
+            try:
+                os.remove(raw_path)
+            except OSError:
+                pass
 
     def _prune_futures(self) -> None:
         """Remove finished futures to avoid unbounded growth."""
