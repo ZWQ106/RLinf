@@ -697,12 +697,39 @@ class CollectionManager:
             # fixed root above); a timestamp keeps each run's logs separate.
             run_tag = time.strftime("%Y%m%d_%H%M%S")
             log_path = shlex.quote(f"./outputs/collect_{run_tag}")
+            # Deterministic keyboard-device pin. The in-container KeyboardListener
+            # (reward_done_wrapper) reads exactly ONE evdev device — the first
+            # under /dev/input/event* advertising A/B/C/Q — and BOTH the physical
+            # keyboard and our virtual keyboard qualify, so which one it binds is
+            # otherwise arbitrary. When it picks the physical keyboard, the
+            # dashboard's injected 's'/'c' land on a device nobody reads and the
+            # wait-for-start gate never releases (teleop never begins). rlinf-eval
+            # is privileged with a live /dev:/dev bind of the host devtmpfs, so a
+            # host-created node IS visible inside.
+            #
+            # Pin by NAME (RLINF_KEYBOARD_DEVICE_NAME), not by the /dev/input/eventN
+            # path: the virtual keyboard is EPHEMERAL (it exists only while this
+            # dashboard process lives) and its event number is NOT stable across
+            # dashboard restarts. A path pin bound the listener to a node that
+            # vanished when the dashboard stopped, killing the listener thread and
+            # all subsequent key input (2026-07-10 — 's' worked, then the dashboard
+            # died mid-episode, event4 disappeared, and 'c'/end-episode was dead).
+            # The name pin is a SOFT preference: the (now resilient) listener falls
+            # back to the physical keyboard when the virtual one is gone and
+            # re-acquires it by name — even at a new event number — when the
+            # dashboard comes back, so no in-container visibility gate is needed.
+            kbd_visible = (self.vkbd is not None and self.vkbd.path is not None
+                           and vkbd_visible_in_container(self.vkbd.path,
+                                                         force=True))
+            kbd_env = (f"RLINF_KEYBOARD_DEVICE_NAME={shlex.quote(VIRTUAL_KBD_NAME)} "
+                       if kbd_visible else "")
             launch_cmd = (
                 "cd /workspace/rlinf && "
                 "export PYTHONPATH=/workspace/rlinf "
                 "EMBODIED_PATH=/workspace/rlinf/examples/embodiment "
                 "RLINF_LIVE_CAM_DIR=/workspace/rlinf/outputs/live_cam "
-                "HF_LEROBOT_HOME=/workspace/rlinf/outputs/lerobot && "
+                "HF_LEROBOT_HOME=/workspace/rlinf/outputs/lerobot "
+                f"{kbd_env}&& "
                 f"{CONTAINER_PY} examples/embodiment/collect_real_data.py "
                 "--config-name realworld_collect_data_polymetis_jointvel "
                 "env.eval.gello_port=/dev/gello "
@@ -737,16 +764,20 @@ class CollectionManager:
             msg = (f"started: {num_episodes} episode(s), "
                    f"task={task_description!r}"
                    + (f", dataset={dataset_name!r}" if dataset_name else ""))
-            # Fresh launch = the moment to recheck container visibility:
-            # collection still starts (physical 'c' always works), but warn
-            # if the dashboard's mark-success injection can't land.
-            if (self.vkbd is not None and self.vkbd.path is not None
-                    and not vkbd_visible_in_container(self.vkbd.path,
-                                                      force=True)):
-                msg += (" — warning: virtual keyboard not visible inside "
-                        "rlinf-eval (/dev is a startup snapshot); "
-                        "mark-success injection won't land — use physical "
-                        "'c', or docker restart rlinf-eval before next run")
+            # Report the keyboard-injection path decided above (kbd_visible was
+            # probed pre-launch). Collection starts either way — the physical
+            # keyboard always works — but tell the operator whether the
+            # dashboard's 's'/'c' buttons will actually reach the listener.
+            if self.vkbd is not None and self.vkbd.path is not None:
+                if kbd_visible:
+                    msg += (f" — keyboard pinned by name to {VIRTUAL_KBD_NAME!r} "
+                            "(dashboard 's'/'c' injection active; auto-recovers "
+                            "across dashboard restarts)")
+                else:
+                    msg += (" — warning: virtual keyboard not visible inside "
+                            "rlinf-eval; dashboard 's'/'c' injection won't land "
+                            "— use the physical keyboard, or docker restart "
+                            "rlinf-eval before next run")
             self.last_action_msg = msg
             _log.info(msg)
             return msg
@@ -1303,33 +1334,42 @@ def _hstack_frames(tiles: list) -> "object":
 class VirtualKeyboard:
     """uinput virtual keyboard that injects KEY_C for success labeling.
 
-    INVESTIGATION (vendor/RLinf/rlinf/envs/realworld/common/keyboard/
-    keyboard_listener.py, read 2026-06-12) — KeyboardListener device
-    selection rule in _open_keyboard_device:
-      1. RLINF_KEYBOARD_DEVICE env override wins (capability-checked).
-      2. Otherwise it iterates sorted(evdev.list_devices()) — a LEXICOGRAPHIC
-         sort of /dev/input/event* paths, so "event10" < "event2" — and binds
-         the FIRST device whose EV_KEY capabilities include KEY_A, KEY_B,
-         KEY_C, KEY_Q. There is NO name filter; it reads exactly ONE device.
+    KeyboardListener device selection (keyboard_listener.py) prefers, in order:
+      1. RLINF_KEYBOARD_DEVICE — a hard path override (capability-checked).
+      2. RLINF_KEYBOARD_DEVICE_NAME — a soft preference: the device whose evdev
+         name matches (this class's VIRTUAL_KBD_NAME), re-resolved on every
+         open so it survives event-number changes.
+      3. Otherwise the FIRST device (lexicographic /dev/input/event* scan)
+         whose EV_KEY caps include KEY_A/B/C/Q. It reads ONE device at a time,
+         but now re-acquires on device loss instead of dying.
 
     Design consequences:
-      * Our device advertises exactly that capability set, so it satisfies
-        the rule. But whether it beats the physical Dell keyboard depends on
-        event-node numbering (which we don't control) under a lexicographic
-        sort — i.e. selection between the two is effectively arbitrary.
-      * The device MUST exist before collection starts: the listener scans
-        /dev/input once, at env startup. Hence creation at dashboard startup,
-        not lazily on first button press.
-      * Deterministic knob: set RLINF_KEYBOARD_DEVICE=<self.path> in the
-        collection launch env. Deliberately NOT wired in by default — if the
-        container can't see the host-created node, KeyboardListener raises at
-        env start and the whole run dies, whereas today the physical keyboard
-        always works as fallback. /api/mark_success reports which device the
-        listener would pick so the Task D smoke can decide.
-      * Container caveat (verified bench fact): rlinf-eval's privileged /dev
-        is a SNAPSHOT taken at container start — a /dev/input/eventN node we
-        create here afterwards is INVISIBLE inside until
-        `docker restart rlinf-eval`. vkbd_visible_in_container() checks this.
+      * Our device advertises exactly that capability set. Without a pin,
+        whether it beats the physical Dell keyboard depends on event-node
+        numbering under a lexicographic sort — effectively arbitrary. That bit
+        us (2026-07-10): the listener bound the physical keyboard, so injected
+        's' never reached the wait-for-start gate.
+      * The device MUST exist before collection starts: the listener opens a
+        device at env startup. Hence creation at dashboard startup, not lazily
+        on first button press.
+      * Pin by NAME, not path (CollectionManager.start() exports
+        RLINF_KEYBOARD_DEVICE_NAME=VIRTUAL_KBD_NAME). This device is EPHEMERAL
+        — it lives only as long as this dashboard process — and its event
+        number is not stable across dashboard restarts. A path pin bound the
+        listener to a node that vanished when the dashboard stopped mid-run
+        (2026-07-10): 's' worked, the dashboard died, event4 disappeared, the
+        listener thread crashed on OSError, and 'c'/end-episode was dead for
+        the rest of the run. The name pin + the listener's re-acquire-on-loss
+        make this self-healing: it falls back to the physical keyboard while
+        the virtual one is gone and rebinds by name when the dashboard returns.
+      * Container visibility (verified 2026-07-10): rlinf-eval is privileged
+        with a LIVE /dev:/dev bind of the host `udev` devtmpfs (per the
+        container's /proc/mounts), NOT a Docker-managed snapshot. A
+        /dev/input/eventN node created on the host afterwards IS visible
+        inside immediately — no `docker restart` needed. (An earlier comment
+        here claimed a startup snapshot; that was wrong for this /dev mount.)
+        vkbd_visible_in_container() still probes per run to stay honest if the
+        container is ever reconfigured with a managed /dev.
     """
 
     def __init__(self):
@@ -1858,7 +1898,13 @@ async function refresh() {
     const j = await r.json();
     const c = j.collection || {};
     let stateLabel, dotCls;
-    if (c.running) {
+    // waiting_for_start is driven by the unbuffered gate FILE, so it is
+    // authoritative even while phase still reads "starting" (Ray buffers the
+    // actor stdout the phase parser keys on). Surface it as its own state so
+    // "arm reset, waiting for s" doesn't masquerade as a stuck "starting".
+    if (c.running && c.waiting_for_start) {
+      stateLabel = '等待开始 / waiting for start'; dotCls = 'ok';
+    } else if (c.running) {
       stateLabel = c.phase === 'error' ? '运行中 (有错误)' : '采集中';
       dotCls = c.phase === 'error' ? 'bad' : 'ok';
     } else if (c.phase === 'error') {
@@ -1869,8 +1915,12 @@ async function refresh() {
       stateLabel = '空闲'; dotCls = 'idle';
     }
     let html = '<table>';
+    // Suppress the raw "(phase=starting)" suffix while waiting at the start
+    // gate — it's the buffered-log phase and reads as "stuck" there.
+    const phaseSuffix = (c.running && c.waiting_for_start)
+      ? '' : ' (phase=' + esc(c.phase || '-') + ')';
     html += '<tr><td><span class="dot ' + dotCls + '"></span>状态</td><td>'
-         + esc(stateLabel) + ' (phase=' + esc(c.phase || '-') + ')</td></tr>';
+         + esc(stateLabel) + phaseSuffix + '</td></tr>';
     // Start gate: arm has reset and is waiting for the operator to begin the
     // (next) episode. Reposition the scene, then press 开始下一条 (or 's').
     if (c.waiting_for_start) {
