@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+import time
 import typing
 
 from rlinf.scheduler import Channel
@@ -75,9 +77,65 @@ class EmbodiedEvalRunner:
         return eval_metrics
 
     def run(self):
+        # Persistent "warm policy" mode: when RLINF_EVAL_GATE_FILE is set (the
+        # TASL eval dashboard sets it), keep the process — Ray cluster, env
+        # workers, and the loaded model — alive across episodes and run one
+        # episode per operator "Start", instead of exiting after a single
+        # evaluate(). Model load + Ray init happen ONCE in init_workers(); each
+        # episode is just another evaluate() (the same call training runs at
+        # every val_check_interval, so repeated calls are a supported path).
+        # Without the env var, behavior is unchanged: one evaluate(), then exit.
+        gate_path = os.environ.get("RLINF_EVAL_GATE_FILE")
+        if gate_path:
+            self._run_gated(gate_path)
+        else:
+            self._run_once(step=0)
+            self.metric_logger.finish()
+
+    def _run_once(self, step: int):
         eval_metrics = self.evaluate()
         eval_metrics = {f"eval/{k}": v for k, v in eval_metrics.items()}
         self.logger.info(eval_metrics)
-        self.metric_logger.log(step=0, data=eval_metrics)
+        self.metric_logger.log(step=step, data=eval_metrics)
 
-        self.metric_logger.finish()
+    @staticmethod
+    def _write_gate(path: str, state: str) -> None:
+        # Sentinel FILE (not stdout): Ray buffers actor stdout, so the dashboard
+        # reads this file (docker exec cat) to drive the Start button reliably.
+        try:
+            with open(path, "w") as f:
+                f.write(state)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _read_gate(path: str) -> typing.Optional[str]:
+        try:
+            with open(path) as f:
+                return f.read().strip() or None
+        except OSError:
+            return None
+
+    def _run_gated(self, gate_path: str):
+        """Warm-policy loop: wait at the gate, run one episode per RUN, repeat.
+
+        The dashboard writes 'RUN' to start the next episode; we flip the gate
+        to 'BUSY' while the episode runs and back to 'WAIT' when it finishes and
+        the arm has homed (env.evaluate resets at the start of each pass). The
+        process only exits when killed (Stop / eval-stop.sh)."""
+        episode = 0
+        self.logger.info(
+            "EVAL_READY: model loaded; warm-policy mode — waiting for Start "
+            f"(gate={gate_path})"
+        )
+        while True:
+            self._write_gate(gate_path, "WAIT")
+            print("WAIT_FOR_START: press Start to run the next eval episode",
+                  flush=True)
+            while self._read_gate(gate_path) != "RUN":
+                time.sleep(0.1)
+            self._write_gate(gate_path, "BUSY")
+            print(f"EPISODE_START: running eval episode {episode}", flush=True)
+            self._run_once(step=episode)
+            print(f"EPISODE_END: eval episode {episode} done", flush=True)
+            episode += 1

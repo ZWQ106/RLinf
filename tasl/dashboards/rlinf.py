@@ -33,6 +33,7 @@ import io
 import json
 import logging
 import os
+import shlex
 import pathlib
 import signal
 import subprocess
@@ -110,6 +111,11 @@ CONFIG_DIR: pathlib.Path = REPO_PATH / "examples/embodiment/config"
 EVAL_SCRIPT: pathlib.Path = REPO_PATH / "examples/embodiment/eval_embodied_agent.py"
 SAVE_DIR: pathlib.Path = pathlib.Path("/tmp/rlinf_pi05_droid_eval")
 EVAL_LOG: pathlib.Path = pathlib.Path("/workspace/rlinf/_dashboard_eval.log")
+# Warm-policy gate sentinel (container path). The eval runner, when launched
+# with RLINF_EVAL_GATE_FILE set, keeps the model loaded and blocks between
+# episodes writing WAIT/BUSY here; the dashboard writes RUN (docker exec) to
+# start the next episode without reloading. Mirrors collect.py's start gate.
+EVAL_GATE_FILE = "/tmp/eval_gate"
 # When dashboard runs on host, eval still runs in the container, so we
 # need to (a) prefix the launch with docker exec and (b) read log/parquet
 # files through docker exec because they live inside the container's /tmp.
@@ -266,12 +272,34 @@ class EvalRunner:
         self.proc: Optional[subprocess.Popen] = None
         self.config_name = "realworld_eval_pi05_droid_polymetis"
         self.last_prompt = "grasp"
+        # Where per-episode rollout MP4s (both cameras tiled) land for the
+        # current/last server session. Set on cold Start; host path is the
+        # bind-mounted repo view so the operator can open it directly.
+        self.video_dir_host: Optional[str] = None
+        self.video_dir_container: Optional[str] = None
         self._lock = threading.Lock()
 
     def start(self, prompt: str) -> str:
         with self._lock:
+            # Warm-policy mode: if the eval server is already up, DON'T reload
+            # the model — just release the start gate so it runs the next
+            # episode. The model + Ray + env stay resident until Stop /
+            # eval-stop.sh. Only the FIRST Start pays the cold model load.
             if self.proc is not None and self.proc.poll() is None:
-                return "already running"
+                note = ""
+                if prompt and prompt != self.last_prompt:
+                    note = (f" — note: task stays {self.last_prompt!r}; changing "
+                            "the task needs a server restart (Stop, then Start)")
+                gate = self._read_gate()
+                if gate == "BUSY":
+                    return "episode already running" + note
+                if gate is None:
+                    return ("server still loading the policy — wait for 'ready', "
+                            "then press Start" + note)
+                # gate == WAIT (arm homed, ready): trigger the next episode.
+                if self._write_gate("RUN"):
+                    return "next episode started (warm policy)" + note
+                return "failed to write eval gate — check the container" + note
             self.last_prompt = prompt
 
             # The in-container RLinf env opens the ZEDs DIRECTLY over pyzed
@@ -288,14 +316,20 @@ class EvalRunner:
                 if HOST_MODE:
                     self._wait_cameras_released()
 
-            # 1. Clean old data dir (LeRobot writer refuses to overwrite).
+            # 1. Clean old data dir (LeRobot writer refuses to overwrite) and
+            #    clear any stale warm-policy gate so a leftover RUN/WAIT from a
+            #    prior server can't trigger a spurious episode on this one.
             if HOST_MODE:
                 subprocess.run(
-                    ["docker", "exec", CONTAINER_NAME, "rm", "-rf",
-                     str(SAVE_DIR)],
+                    ["docker", "exec", CONTAINER_NAME, "bash", "-c",
+                     f"rm -rf {shlex.quote(str(SAVE_DIR))}; rm -f {EVAL_GATE_FILE}"],
                     check=False,
                 )
             else:
+                try:
+                    os.remove(EVAL_GATE_FILE)
+                except OSError:
+                    pass
                 try:
                     if SAVE_DIR.exists():
                         import shutil
@@ -308,6 +342,14 @@ class EvalRunner:
             ts = time.strftime("%Y%m%d-%H:%M:%S-dashboard")
             container_repo = pathlib.Path(DEFAULT_REPO_PATH_CONTAINER)
             log_dir_inside = container_repo / "logs" / ts
+            # Rollout videos land under runner.logger.log_path/video/eval (see
+            # the env video_cfg). Record both the container path and the
+            # host-visible path (same tree via the bind-mounted repo) so the
+            # dashboard can show where to find the MP4s.
+            self.video_dir_container = str(log_dir_inside / "video" / "eval")
+            self.video_dir_host = str(
+                pathlib.Path(DEFAULT_REPO_PATH_HOST) / "logs" / ts / "video" / "eval"
+            )
             # Hydra-formatted joint list (no spaces — hydra parses).
             home_q = self.home_store.get()
             home_q_str = "[" + ",".join(f"{v:.6f}" for v in home_q) + "]"
@@ -320,6 +362,9 @@ class EvalRunner:
                 # file://${oc.env:EMBODIED_PATH}/config/ — without this the run
                 # dies at startup with "Environment variable 'EMBODIED_PATH' not found".
                 f"EMBODIED_PATH={container_repo}/examples/embodiment "
+                # Warm-policy mode: keep the model loaded, run one episode per
+                # Start (gate-driven), stay up until Stop / eval-stop.sh.
+                f"RLINF_EVAL_GATE_FILE={EVAL_GATE_FILE} "
                 f"/opt/venv/openpi/bin/python "
                 f"{container_repo}/examples/embodiment/eval_embodied_agent.py "
                 f"--config-path={container_repo}/examples/embodiment/config/ "
@@ -371,7 +416,58 @@ class EvalRunner:
             threading.Thread(
                 target=self._wait_for_exit, daemon=True
             ).start()
-            return f"started pid={self.proc.pid}"
+            # Auto-run the first episode once the server signals it's ready
+            # (model loaded + arm homed → gate WAIT), so the initial Start is a
+            # single click like before.
+            threading.Thread(
+                target=self._auto_run_when_ready, daemon=True
+            ).start()
+            return (f"server starting pid={self.proc.pid} — loading policy; "
+                    "first episode auto-runs when ready")
+
+    def _auto_run_when_ready(self, timeout_s: float = 240.0) -> None:
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if self.proc is None or self.proc.poll() is not None:
+                return  # server died during startup
+            if self._read_gate() == "WAIT":
+                if self._write_gate("RUN"):
+                    _log.info("warm-policy: first episode auto-started")
+                return
+            time.sleep(0.5)
+        _log.warning("warm-policy: server not ready within "
+                     f"{timeout_s:.0f}s; press Start to run the first episode")
+
+    def _read_gate(self) -> Optional[str]:
+        """Warm-policy gate state (WAIT/BUSY) written by the eval runner, or
+        None if absent/unreadable. Read via docker exec in host mode."""
+        try:
+            if HOST_MODE:
+                r = subprocess.run(
+                    ["docker", "exec", CONTAINER_NAME, "cat", EVAL_GATE_FILE],
+                    capture_output=True, timeout=10)
+                if r.returncode != 0:
+                    return None
+                return r.stdout.decode("utf-8", "replace").strip() or None
+            with open(EVAL_GATE_FILE) as f:
+                return f.read().strip() or None
+        except Exception:
+            return None
+
+    def _write_gate(self, state: str) -> bool:
+        """Write the gate sentinel (dashboard only ever writes 'RUN')."""
+        try:
+            if HOST_MODE:
+                r = subprocess.run(
+                    ["docker", "exec", CONTAINER_NAME, "bash", "-c",
+                     f"printf %s {shlex.quote(state)} > {EVAL_GATE_FILE}"],
+                    capture_output=True, timeout=10)
+                return r.returncode == 0
+            with open(EVAL_GATE_FILE, "w") as f:
+                f.write(state)
+            return True
+        except Exception:
+            return False
 
     def _wait_for_exit(self):
         if self.proc is None:
@@ -470,11 +566,26 @@ class EvalRunner:
     def status(self) -> dict:
         with self._lock:
             running = self.proc is not None and self.proc.poll() is None
+            # Warm-policy phase from the gate: WAIT = homed & ready for the next
+            # Start, BUSY = episode running, None/loading = model still loading.
+            gate = self._read_gate() if running else None
+            if not running:
+                phase = "idle"
+            elif gate == "WAIT":
+                phase = "ready"
+            elif gate == "BUSY":
+                phase = "running"
+            else:
+                phase = "loading"
             return {
                 "running": running,
                 "pid": self.proc.pid if self.proc else None,
                 "returncode": self.proc.returncode if self.proc else None,
                 "last_prompt": self.last_prompt,
+                "gate": gate,
+                "phase": phase,
+                "video_dir": self.video_dir_host,
+                "video_dir_container": self.video_dir_container,
                 "log_tail": _read_log_tail(EVAL_LOG, n=30),
             }
 
@@ -838,8 +949,13 @@ INDEX_HTML = """<!doctype html>
     <label>Prompt</label>
     <input type="text" id="prompt" value="grasp"/>
     <div style="margin-top:8px">
-      <button class="primary" onclick="startEval()">Start eval</button>
-      <button class="danger" onclick="api('/stop')">Stop eval</button>
+      <button class="primary" onclick="startEval()">Start / next episode</button>
+      <button class="danger" onclick="api('/stop')">Stop server</button>
+    </div>
+    <div style="font-size:12px;color:#888;margin-top:4px">
+      First Start loads the policy once and keeps it warm; each later Start runs
+      the next episode. Stop server (or eval-stop.sh) tears it down. Changing the
+      prompt needs a Stop + Start.
     </div>
     <h3 style="margin-top:18px">Robot</h3>
     <button onclick="api('/home')">Go home</button>
@@ -946,10 +1062,21 @@ async function refresh() {
          +  '<td>width=' + (j.gripper && j.gripper.width_m !== undefined
                             ? j.gripper.width_m.toFixed(3)+'m' : '?')
          +  '</td></tr>';
+    const phaseTxt = {loading:'⏳ loading policy…', ready:'⏸ ready — press Start for next episode',
+                      running:'▶ episode running', idle:'idle'}[re.phase] || (re.phase||'-');
     html += '<tr><td>'+dot(re.running)+'eval</td>'
-         +  '<td>pid=' + (re.pid||'-')
+         +  '<td><b>' + phaseTxt + '</b>'
+         +  '<br>pid=' + (re.pid||'-')
          +  '  rc=' + (re.returncode===null?'-':re.returncode)
          +  '<br>prompt=' + (re.last_prompt || '-') + '</td></tr>';
+    if (re.video_dir) {
+      html += '<tr><td>videos</td><td>'
+           +  '<span style="font-size:11px;color:#7a7a7a;font-family:monospace;'
+           +  'word-break:break-all">' + re.video_dir
+           +  '/seed_&lt;seed&gt;/&lt;n&gt;.mp4</span>'
+           +  '<br><span style="font-size:11px;color:#888">both cameras tiled '
+           +  '(exterior | wrist), one MP4 per episode</span></td></tr>';
+    }
     html += '<tr><td>'+dot(j.cam_running)+'cams</td>'
          +  '<td>' + (j.cam_running ? 'dashboard holds' : 'released (eval or idle)') + '</td></tr>';
     if (j.last_episode && j.last_episode.available) {
