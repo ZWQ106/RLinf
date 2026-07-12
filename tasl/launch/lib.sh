@@ -156,6 +156,38 @@ zeds_free() {
   [[ "$serials" == *"$ZED_EXTERIOR"* && "$serials" == *"$ZED_WRIST"* ]]
 }
 
+# STEREOLABS USB ids for the two CAMERA interfaces (not the f6xx HID controls):
+#   f880 = ZED 2i (exterior), f682 = ZED-M (wrist). Kept in sync with zed-check.sh.
+ZED_USB_IDS=(2b03:f880 2b03:f682)
+
+# zeds_reset: USB-reset both ZEDs to clear the post-kill / hot-plug SDK wedge
+# (enumerated on USB but get_device_list() == []). Needs root + a free camera
+# (no process holding it), so call this AFTER reaping stale eval/collect procs.
+zeds_reset() {
+  if [[ -n "$LAUNCH_DRY_RUN" ]]; then echo "DRY zed usbreset: ${ZED_USB_IDS[*]}"; return 0; fi
+  if [[ "$(id -u)" != 0 ]]; then warn "zeds_reset needs root (skipping usbreset)"; return 1; fi
+  local id
+  for id in "${ZED_USB_IDS[@]}"; do
+    if usbreset "$id" >/dev/null 2>&1; then ok "usbreset $id"; else warn "usbreset $id failed (camera absent / still held?)"; fi
+  done
+  sleep 2   # let the SDK re-enumerate before the next probe
+}
+
+# zeds_free_or_reset: ensure both ZEDs are SDK-visible, auto USB-resetting on a
+# wedge instead of failing. Probe first (no reset if already fine); otherwise
+# reset + re-probe up to N times. Returns non-zero only if still wedged after
+# all attempts (a real reseat/reboot case). Reap ZED holders before calling.
+zeds_free_or_reset() {
+  local tries="${1:-2}" i
+  zeds_free && return 0
+  for ((i = 1; i <= tries; i++)); do
+    warn "ZEDs not SDK-visible — auto USB-reset (attempt $i/$tries)"
+    zeds_reset
+    zeds_free && { ok "ZEDs recovered after USB reset"; return 0; }
+  done
+  return 1
+}
+
 # gpu_free: no compute process on the Desktop GPU (serve + training froze the box).
 gpu_free() {
   if [[ -n "$LAUNCH_DRY_RUN" ]]; then echo "DRY nvidia-smi compute-apps"; [[ "${DRY_GPU_FREE:-1}" == 1 ]]; return; fi

@@ -116,11 +116,14 @@ desk "pkill -TERM -f '[/_]collect[.]py' || true"
 desk "pkill -TERM -f '[/_]rlinf[.]py'   || true"
 [[ -z "$LAUNCH_DRY_RUN" ]] && sleep 2
 
-step "  cameras: both ZEDs free ($ZED_EXTERIOR exterior, $ZED_WRIST wrist)"
-zeds_free || die "ZEDs not both visible to the SDK. If no dashboard/eval holds them, it's usually a post-hot-plug USB wedge — run: $_DIR/zed-check.sh --reset  (then re-run). See zed-check.sh for escalation."
-
-step "  reap stale eval procs in rlinf-eval"
+# Reap FIRST (a prior eval-stop -9'd the in-container ZED holder mid-capture,
+# which wedges the ZED USB), THEN auto USB-reset if the SDK can't see them —
+# so restarting eval no longer needs a manual `zed-check.sh --reset`.
+step "  reap stale eval procs in rlinf-eval (frees any ZED holder)"
 desk "docker exec rlinf-eval bash -lc 'pkill -9 -f \"[e]val_embodied_agent.py\"; pkill -9 -f \"[r]ay::\"; pkill -9 -f \"[r]aylet\"; pkill -9 -f \"[P]olymetisController\"; /opt/venv/openpi/bin/ray stop --force 2>/dev/null; rm -rf /tmp/ray; true'"
+
+step "  cameras: ensure both ZEDs free ($ZED_EXTERIOR exterior, $ZED_WRIST wrist) — auto USB-reset if wedged"
+zeds_free_or_reset || die "ZEDs still not visible after auto USB-reset. This is now a hardware case: physically unplug/replug the exterior ZED 2i USB and re-run, or reboot (last resort). See $_DIR/zed-check.sh for escalation."
 
 step "  launch eval dashboard :8003 (--mode host, polymetis zerorpc backend)"
 desk "cd $TASL && ulimit -n 8192 && PYTHONPATH=$TASL:$SITE_PKGS NUC1_HOST=$NUC1_HOST setsid /usr/bin/python3 dashboards/rlinf.py --port 8003 --mode host </dev/null >> $TASL/logs/eval.log 2>&1 &"
