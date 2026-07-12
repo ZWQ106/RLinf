@@ -554,11 +554,55 @@ class RecordVideo(gym.Wrapper):
         future = self._executor.submit(self._save_video, frames, mp4_path)
         self._save_futures.append(future)
 
+    def _normalize_frames(self, frames: list[np.ndarray]) -> list[np.ndarray]:
+        """Coerce all frames to one constant, even (H, W), 3-channel uint8.
+
+        H.264/yuv420p require every frame to share the same dimensions and even
+        width/height. A stray differently-sized frame (e.g. a step where only
+        the main camera was present) otherwise yields a broken/unplayable MP4.
+        Target size is the first frame's, trimmed to even."""
+        if not frames:
+            return frames
+        h0, w0 = frames[0].shape[:2]
+        h0 -= h0 % 2
+        w0 -= w0 % 2
+        out: list[np.ndarray] = []
+        for f in frames:
+            f = np.asarray(f)
+            if f.ndim == 2:
+                f = np.stack([f] * 3, axis=-1)
+            if f.ndim == 3 and f.shape[-1] == 4:
+                f = f[..., :3]
+            if f.shape[0] != h0 or f.shape[1] != w0:
+                try:
+                    import cv2
+
+                    f = cv2.resize(f, (w0, h0), interpolation=cv2.INTER_LINEAR)
+                except Exception:
+                    f = f[:h0, :w0]
+            if f.dtype != np.uint8:
+                f = f.astype(np.uint8)
+            out.append(np.ascontiguousarray(f))
+        return out
+
     def _save_video(self, frames: list[np.ndarray], mp4_path: str) -> None:
-        """Save frames to disk (runs in background)."""
+        """Save frames to disk (runs in background) as H.264 (libx264)."""
+        frames = self._normalize_frames(frames)
+        if not frames:
+            return
         video_writer = None
         try:
-            video_writer = imageio.get_writer(mp4_path, fps=self._fps)
+            # Explicit libx264 + yuv420p for a broadly compatible, playable MP4;
+            # macro_block_size=1 keeps the exact (already-even) dimensions
+            # instead of padding to a multiple of 16.
+            video_writer = imageio.get_writer(
+                mp4_path,
+                fps=self._fps,
+                codec="libx264",
+                pixelformat="yuv420p",
+                macro_block_size=1,
+                output_params=["-crf", "20", "-preset", "medium"],
+            )
             for img in frames:
                 video_writer.append_data(img)
         except Exception as exc:
