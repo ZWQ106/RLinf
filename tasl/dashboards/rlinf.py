@@ -52,6 +52,12 @@ from PIL import Image
 SN_ZED_2I_RIGHT = 36443134
 SN_ZED_MINI_WRIST = 17150101
 
+# Policy-view preview mode — MUST match `image_resize_mode` in the eval env
+# config (realworld_franka_jointvel_polymetis.yaml) so the dashboard tile is
+# WYSIWYG with the model input. "crop" reproduces the May 29-30 known-good runs;
+# "pad" is openpi's resize_with_pad (full FOV). Flip both together when A/B'ing.
+POLICY_VIEW_MODE = os.environ.get("RLINF_POLICY_VIEW_MODE", "crop")
+
 # Default home pose = the DROID anchor pose, MUST match the env config's
 # `joint_reset_qpos` (realworld_franka_jointvel_polymetis.yaml) — the dashboard
 # overrides the eval's joint_reset_qpos with this on Start, so a mismatch homes
@@ -234,12 +240,12 @@ class CamManager:
             return self._latest_jpeg.get(name)
 
     def get_policy_view_jpeg(self, name: str, size: int = 224) -> Optional[bytes]:
-        """Return the exact frame the policy would see: letterbox pad + resize.
+        """Return the exact frame the policy would see, WYSIWYG with the env.
 
-        Mirrors FrankaEnv's image_resize_mode: "pad" (the DROID-correct
-        preprocessing) so the policy view is WYSIWYG with what RLinf's EnvWorker
-        feeds the model — the full undistorted FOV squared with black bars, NOT
-        a centre crop. Keep in sync with FrankaEnv._pad_to_square.
+        Must match FrankaEnv.image_resize_mode. Set POLICY_VIEW_MODE below to the
+        same value as image_resize_mode in the eval env config:
+          "crop" -> centre-square crop  (reproduces the May 29-30 known-good runs)
+          "pad"  -> letterbox, full FOV (openpi resize_with_pad; FrankaEnv._pad_to_square)
         """
         with self._frame_lock:
             jpeg = self._latest_jpeg.get(name)
@@ -248,14 +254,21 @@ class CamManager:
         try:
             arr = np.asarray(Image.open(io.BytesIO(jpeg)).convert("RGB"))
             h, w = arr.shape[:2]
-            # Letterbox to a centered square (full FOV preserved), matching the
-            # env's pad path; a centre crop here would misrepresent the input.
-            sq = max(h, w)
-            pad_t = (sq - h) // 2
-            pad_l = (sq - w) // 2
-            square = np.zeros((sq, sq, 3), dtype=arr.dtype)
-            square[pad_t:pad_t + h, pad_l:pad_l + w] = arr
-            small = cv2.resize(square, (size, size), interpolation=cv2.INTER_AREA)
+            if POLICY_VIEW_MODE == "pad":
+                # Letterbox to a centered square (full FOV preserved).
+                sq = max(h, w)
+                pad_t = (sq - h) // 2
+                pad_l = (sq - w) // 2
+                square = np.zeros((sq, sq, 3), dtype=arr.dtype)
+                square[pad_t:pad_t + h, pad_l:pad_l + w] = arr
+                proc = square
+            else:
+                # Centre-square crop (default; matches the known-good crop path).
+                side = min(h, w)
+                sy = (h - side) // 2
+                sx = (w - side) // 2
+                proc = arr[sy:sy + side, sx:sx + side]
+            small = cv2.resize(proc, (size, size), interpolation=cv2.INTER_AREA)
             buf = io.BytesIO()
             Image.fromarray(small).save(buf, format="JPEG", quality=self.jpeg_quality)
             return buf.getvalue()
@@ -938,7 +951,7 @@ INDEX_HTML = """<!doctype html>
 </div>
 <div class="row" style="margin-top:8px">
   <div class="col cam" style="flex:0 1 auto">
-    <div class="label">policy view — exterior (224×224 pad)</div>
+    <div class="label">policy view — exterior (224×224 {{ policy_view_mode }})</div>
     <img src="/cam/wrist_1_policy.mjpg" alt="exterior policy"
          style="width:224px;height:224px;image-rendering:pixelated"/>
   </div>
@@ -1113,7 +1126,7 @@ def build_app(rs: RS, cams: CamManager, runner: EvalRunner,
 
     @app.get("/")
     def index():
-        return render_template_string(INDEX_HTML)
+        return render_template_string(INDEX_HTML, policy_view_mode=POLICY_VIEW_MODE)
 
     @app.get("/cam/<name>.mjpg")
     def mjpg(name):

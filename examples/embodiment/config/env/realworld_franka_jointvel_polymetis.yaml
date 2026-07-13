@@ -59,13 +59,17 @@ override_cfg:
   # feasible @15Hz for both cams (0 drops).
   camera_resolution: [1280, 720]
 
-  # DROID-correct image preprocessing for zero-shot pi05_droid eval:
-  #   image_resize_mode: pad  -> letterbox to square, preserving the FULL FOV
-  #     (matches openpi's tf.image.resize_with_pad). A centre crop (the
-  #     collection default) drops ~44% of the ZED width and wrecks the policy.
-  #   obs_image_size: 224     -> feed the model's native size directly, so
-  #     openpi's internal resize_with_pad is a no-op (no lossy 128->224 step).
-  image_resize_mode: pad
+  # Image preprocessing for zero-shot pi05_droid eval.
+  #   image_resize_mode: crop -> centre-square crop. This REPRODUCES the known-
+  #     good May 29-30 runs (rlinf-clone-rtc-old, _center_crop_resize) which
+  #     also cropped at 224. Start here to restore verified behavior.
+  #   image_resize_mode: pad  -> letterbox to square (openpi resize_with_pad),
+  #     the theoretically pi05-correct full-FOV path. A/B against crop only if
+  #     crop@224 still misbehaves.
+  #   obs_image_size: 224     -> match the old working runs and the model's
+  #     native size (openpi's internal resize_with_pad becomes a no-op). The
+  #     recently-broken path used 128, so 224 is the real known-good value.
+  image_resize_mode: crop
   obs_image_size: 224
 
   # Reset/home joint pose: DROID home [q1..q7] in radians.
