@@ -69,7 +69,8 @@ override_cfg:
   #   obs_image_size: 224     -> match the old working runs and the model's
   #     native size (openpi's internal resize_with_pad becomes a no-op). The
   #     recently-broken path used 128, so 224 is the real known-good value.
-  image_resize_mode: crop
+  # image_resize_mode: crop
+  image_resize_mode: pad
   obs_image_size: 224
 
   # Reset/home joint pose: DROID home [q1..q7] in radians.
