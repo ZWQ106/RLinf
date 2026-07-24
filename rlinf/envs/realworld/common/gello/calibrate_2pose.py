@@ -12,16 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Two-pose GELLO calibration + verification (all-in-one).
+"""Per-joint GELLO calibration + verification (all-in-one).
 
 A single matched pose is underdetermined per joint (``q = sign*(raw - offset)``
 is one equation, two unknowns; the SIGN is unobservable without motion), so a
 static check can't catch a wrong sign — it passes when still, then runs away in
-teleop. This drives the arm to TWO poses (speed-bounded leash), you match the
-leader at each, and solves both from the difference::
+teleop. We need the arm to MOVE and the operator to match that motion.
 
-    sign_i   = (robotA_i - robotB_i) / (rawA_i - rawB_i)     # slope -> +-1
-    offset_i = rawA_i - sign_i * robotA_i                    # intercept -> pi/2
+Rather than jumping to one pose with all seven joints displaced at once (which
+is hard to read — you can't tell which leader joint to twist), this calibrates
+**one joint at a time**. First it homes and captures a full reference match.
+Then, for each joint i: it drives ONLY joint i away from home (speed-bounded
+leash), you twist ONLY that joint on the leader to follow, it captures, solves
+that joint's sign + offset from the home→twisted difference::
+
+    sign_i   = (robot_twist_i - robot_home_i) / (raw_twist_i - raw_home_i)   # slope -> +-1
+    offset_i = raw_home_i - sign_i * robot_home_i                           # intercept -> pi/2
+
+and returns joint i home before moving to the next. Because each joint moves
+alone, it is unambiguous which leader joint to follow.
 
 Then (by default) it WRITES the result into ``fr3_gello_config.py`` and VERIFIES
 it against the robot (match the leader to the homed arm; per-joint error must be
@@ -49,15 +58,18 @@ PORT = "/dev/gello"
 BAUD = 57600
 IDS = [1, 2, 3, 4, 5, 6, 7]
 _PI2 = np.pi / 2
-# Pose A = the DROID home anchor. Pose B moves every joint far enough that its
-# slope (hence sign) is unambiguous despite operator matching error. The ROLL
-# joints (J1/J3/J5/J7) get LARGE deltas (~0.9 rad) — base/wrist rotation is hard
-# to match by eye, and a too-small delta is exactly what flipped J1's sign. Pitch
+# HOME = the DROID home anchor (the per-joint reference pose). TWIST holds the
+# single-joint target each joint is driven to (only that one element differs from
+# HOME at any moment). Each joint's displacement is large enough that its slope
+# (hence sign) is unambiguous despite operator matching error. The ROLL joints
+# (J1/J3/J5/J7) get LARGE deltas (~0.9 rad) — base/wrist rotation is hard to
+# match by eye, and a too-small delta is exactly what flipped J1's sign. Pitch
 # joints (J2/J4/J6) stay moderate (they carry load / are nearer the table). All
-# within FR3 limits, arm stays up.
-POSE_A = [0.0, -0.6283, 0.0, -2.5133, 0.0, 1.8850, 0.0]
-POSE_B = [1.00, -0.15, 0.90, -2.00, 0.90, 1.30, 0.90]
-MATCH_SECONDS = 25
+# within FR3 limits, arm stays up.  (POSE_A/POSE_B kept as aliases for back-compat.)
+HOME = [0.0, -0.6283, 0.0, -2.5133, 0.0, 1.8850, 0.0]
+TWIST = [1.00, -0.15, 0.90, -2.00, 0.90, 1.30, 0.90]
+POSE_A, POSE_B = HOME, TWIST
+MATCH_SECONDS = 20
 VERIFY_TOL = 0.30
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "fr3_gello_config.py")
 
@@ -98,40 +110,61 @@ def _goto(robot, label, pose):
     print(f"    arm at {label} (max joint err {err:.3f} rad).", flush=True)
 
 
-def _capture(driver, robot, label, pose):
+def _capture(driver, robot, label, pose, instr=None):
     _goto(robot, label, pose)
-    print(f"    >>> MATCH the leader to the arm and HOLD steady ({MATCH_SECONDS}s) <<<", flush=True)
+    instr = instr or "MATCH the leader to the arm"
+    print(f"    >>> {instr} and HOLD steady ({MATCH_SECONDS}s) <<<", flush=True)
     raw = _read_raw_steady(driver, MATCH_SECONDS)
     rob = np.asarray(robot.get_joint_positions()[:7], dtype=float)
     print(f"    captured {label}: robot={[round(float(x),3) for x in rob]}", flush=True)
     return raw, rob
 
 
-def calibrate(driver, robot):
-    """Two-pose solve -> (offsets_pi2, signs, ok_flags)."""
-    rawA, robA = _capture(driver, robot, "POSE A (home)", POSE_A)
-    rawB, robB = _capture(driver, robot, "POSE B", POSE_B)
-    draw, drob = rawA - rawB, robA - robB
-    # Unwrap the raw difference into [-pi, pi] — the true per-joint delta is < pi,
-    # so a larger |draw| means the servo angle wrapped; fold it back so the slope
-    # sign is correct.
+def _solve_joint(i, draw, drob, raw_home_i, rob_home_i):
+    """Solve one joint's (offset_pi2, sign, ok) from its home->twisted deltas."""
+    # Unwrap the raw delta into [-pi, pi] — the true per-joint delta is < pi, so a
+    # larger |draw| means the servo angle wrapped; fold it back so the slope sign
+    # is correct.
     draw = (draw + np.pi) % (2 * np.pi) - np.pi
-    offs, signs, oks = [], [], []
-    print("\n========== SOLVE ==========")
+    if abs(draw) < 0.08:
+        print(f"J{i+1}   ?          ?       ?       ?   BARELY MOVED — twist J{i+1} more")
+        return 0, 1, False
+    slope = drob / draw
+    s = 1 if slope >= 0 else -1
+    off = raw_home_i - s * rob_home_i
+    mult = int(np.round(off / _PI2))
+    resid = off - mult * _PI2
+    good = abs(resid) < 0.35 and abs(abs(slope) - 1.0) < 0.4
+    print(f"J{i+1} {s:>5} {mult:>10} {resid:>+7.2f} {slope:>+7.2f}  "
+          f"{'ok' if good else 'CHECK: match better / twist more'}")
+    return mult, s, good
+
+
+def calibrate(driver, robot):
+    """Per-joint solve -> (offsets_pi2, signs, ok_flags).
+
+    Home once for a full reference match, then for each joint: twist ONLY that
+    joint, solve it, and return home before the next. One joint moves at a time,
+    so it is unambiguous which leader joint to follow.
+    """
+    rawH, robH = _capture(
+        driver, robot, "HOME (reference)", HOME,
+        instr="MATCH the WHOLE leader to the homed arm",
+    )
+    offs, signs, oks = [0] * 7, [1] * 7, [False] * 7
+    print("\n========== PER-JOINT SOLVE ==========")
     print(f"{'J':>3} {'sign':>5} {'off(pi/2)':>10} {'resid':>7} {'slope':>7}  quality")
     for i in range(7):
-        if abs(draw[i]) < 0.08:
-            print(f"J{i+1}   ?          ?       ?       ?   BARELY MOVED — increase POSE_B delta")
-            offs.append(0); signs.append(1); oks.append(False); continue
-        slope = drob[i] / draw[i]
-        s = 1 if slope >= 0 else -1
-        off = rawA[i] - s * robA[i]
-        mult = int(np.round(off / _PI2))
-        resid = off - mult * _PI2
-        good = abs(resid) < 0.35 and abs(abs(slope) - 1.0) < 0.4
-        print(f"J{i+1} {s:>5} {mult:>10} {resid:>+7.2f} {slope:>+7.2f}  "
-              f"{'ok' if good else 'CHECK: match better / bigger delta'}")
-        offs.append(mult); signs.append(s); oks.append(good)
+        pose = list(HOME)
+        pose[i] = TWIST[i]  # move ONLY joint i away from home
+        rawJ, robJ = _capture(
+            driver, robot, f"JOINT J{i+1}", pose,
+            instr=f"twist ONLY joint J{i+1} on the leader to follow (hold the rest)",
+        )
+        offs[i], signs[i], oks[i] = _solve_joint(
+            i, rawJ[i] - rawH[i], robJ[i] - robH[i], rawH[i], robH[i]
+        )
+        _goto(robot, f"return J{i+1} to home", HOME)  # reset before the next joint
     return offs, signs, oks
 
 
