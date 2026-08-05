@@ -72,13 +72,19 @@ def _validate_teleop_mode(use_spacemouse: bool, use_gello: bool) -> None:
         )
 
 
-def _apply_keyboard_reward(env: gym.Env, mode: Optional[str]) -> gym.Env:
+def _apply_keyboard_reward(env: gym.Env, mode: Optional[str],
+                           release_before_record: bool = False) -> gym.Env:
+    """`release_before_record` splits the per-episode start gate in two:
+    's' releases the robot for positioning, 'r' begins recording. Off by
+    default — every existing config keeps the single-'s' behaviour."""
     if env.config.is_dummy or not mode:
         return env
     if mode == "multi_stage":
-        return KeyboardRewardDoneMultiStageWrapper(env)
+        return KeyboardRewardDoneMultiStageWrapper(
+            env, release_before_record=release_before_record)
     if mode == "single_stage":
-        return KeyboardRewardDoneWrapper(env)
+        return KeyboardRewardDoneWrapper(
+            env, release_before_record=release_before_record)
     return env
 
 
@@ -124,7 +130,11 @@ def apply_single_arm_wrappers(env: gym.Env, cfg: Mapping[str, Any]) -> gym.Env:
             )
         env = GelloIntervention(env, port=gello_port, gripper_enabled=gripper_enabled)
 
-    env = _apply_keyboard_reward(env, cfg.get("keyboard_reward_wrapper", None))
+    env = _apply_keyboard_reward(
+        env,
+        cfg.get("keyboard_reward_wrapper", None),
+        release_before_record=bool(cfg.get("release_before_record", False)),
+    )
 
     if cfg.get("use_relative_frame", True):
         env = RelativeFrame(env)
@@ -156,7 +166,11 @@ def apply_single_arm_jointvel_wrappers(env: gym.Env, cfg: Mapping[str, Any]) -> 
             vmax=float(cfg.get("gello_vmax", 1.0)),
             gripper_enabled=not cfg.get("no_gripper", False),
         )
-    env = _apply_keyboard_reward(env, cfg.get("keyboard_reward_wrapper", None))
+    env = _apply_keyboard_reward(
+        env,
+        cfg.get("keyboard_reward_wrapper", None),
+        release_before_record=bool(cfg.get("release_before_record", False)),
+    )
     return env
 
 
@@ -194,7 +208,11 @@ def apply_dual_arm_wrappers(env: gym.Env, cfg: Mapping[str, Any]) -> gym.Env:
             gripper_enabled=gripper_enabled,
         )
 
-    env = _apply_keyboard_reward(env, cfg.get("keyboard_reward_wrapper", None))
+    env = _apply_keyboard_reward(
+        env,
+        cfg.get("keyboard_reward_wrapper", None),
+        release_before_record=bool(cfg.get("release_before_record", False)),
+    )
 
     if cfg.get("use_relative_frame", True):
         env = DualRelativeFrame(env)

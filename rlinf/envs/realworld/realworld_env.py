@@ -152,6 +152,17 @@ class RealWorldEnv(gym.Env):
     def elapsed_steps(self):
         return self._elapsed_steps
 
+    def begin_recorded_episode(self):
+        """Zero the per-episode counters so a recorded episode starts clean.
+
+        For the two-stage teleop start gate: after the robot is released the
+        operator drives it into position, and those warm-up steps are stepped
+        through the env but never recorded. Without this they would still
+        count toward ``max_episode_steps`` (truncating the real episode early)
+        and pollute the episode metrics.
+        """
+        self._reset_metrics()
+
     def _init_metrics(self):
         self.prev_step_reward = np.zeros(self.num_envs)
 

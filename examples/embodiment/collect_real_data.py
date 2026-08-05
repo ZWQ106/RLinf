@@ -131,6 +131,16 @@ class DataCollector(Worker):
 
             next_obs_processed = self._process_obs(next_obs)
 
+            # Two-stage start gate: the robot has been released so the operator
+            # can drive it into the starting pose, but that is not part of the
+            # demonstration. Advance the observation and drop the transition —
+            # recording begins on the step after 'r'. (Absent key => always
+            # recording, so single-stage configs are unaffected.)
+            if not info.get("recording", True):
+                obs = next_obs
+                current_obs_processed = next_obs_processed
+                continue
+
             terminated_tensor = terminated.unsqueeze(1)
             truncated_tensor = truncated.unsqueeze(1)
             done_tensor = terminated_tensor | truncated_tensor

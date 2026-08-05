@@ -61,6 +61,11 @@ env:
     # Operator labels success with the keyboard (reward 1 + done); auto-reward
     # via target_ee_pose is unreliable until that pose is measured (TODO(P1)).
     keyboard_reward_wrapper: single_stage
+    # Two-stage start gate: 's' RELEASES the robot (teleop live, nothing
+    # recorded) so the operator can drive it into the true starting pose, then
+    # 'r' begins recording. Getting into position is not part of the
+    # demonstration, and recording it teaches the policy motions we don't want.
+    release_before_record: True
     override_cfg:
       task_description: "pick up the cube"
       target_ee_pose: [0.5, 0.0, 0.1, -3.14, 0.0, 0.0]

@@ -140,6 +140,9 @@ class CollectEpisode(gym.Wrapper):
         self._episode_ids = [0] * num_envs
         self._episode_success = [False] * num_envs
         self._global_step = 0
+        # SVO recording is armed by reset() and started by the first RECORDED
+        # step, so the two-stage gate's positioning phase stays out of it.
+        self._svo_pending = False
         # Holds the post-reset obs for auto-reset envs to prepend to next episode.
         self._pending_obs: list[Any] = [None] * num_envs
         self._pending_info: list[Any] = [None] * num_envs
@@ -204,8 +207,32 @@ class CollectEpisode(gym.Wrapper):
 
         self._show_goal_site_visual()
         self._record_reset_obs(obs)
-        self._start_svo()
+        # SVO starts on the first RECORDED step, not here. With the two-stage
+        # teleop start gate the operator drives the arm into its starting pose
+        # after reset, and that motion is not part of the demonstration — it
+        # must not end up in the SVO either. Single-stage configs record from
+        # their first step, so this only defers the start by one tick.
+        self._svo_pending = True
         return obs, info
+
+    @staticmethod
+    def _is_recording(info) -> bool:
+        """Whether this transition belongs in the demonstration.
+
+        False only during the release phase of the two-stage start gate (see
+        BaseKeyboardRewardDoneWrapper). A missing key means "recording", so
+        every other env and config is unaffected.
+        """
+        if not isinstance(info, dict) or "recording" not in info:
+            return True
+        scalar = CollectEpisode._to_bool_scalar(info["recording"])
+        return True if scalar is None else scalar
+
+    def _reseed_buffers(self, obs) -> None:
+        """Throw away what is buffered and restart from `obs`."""
+        for env_idx in range(self.num_envs):
+            self._reset_env_buffer(env_idx)
+        self._record_reset_obs(obs)
 
     def step(self, action, **kwargs):
         """Execute a step and record the transition.
@@ -218,6 +245,17 @@ class CollectEpisode(gym.Wrapper):
             Tuple of (obs, reward, terminated, truncated, info).
         """
         obs, reward, terminated, truncated, info = self.env.step(action, **kwargs)
+        if not self._is_recording(info):
+            # Release phase: the arm follows the leader so the operator can
+            # reach the starting pose. Drop the transition, and keep re-seeding
+            # so the episode begins from wherever the arm actually ends up —
+            # this wrapper writes the dataset, so gating the collector's own
+            # rollout buffer alone would still have saved every frame.
+            self._reseed_buffers(obs)
+            return obs, reward, terminated, truncated, info
+        if self._svo_pending:
+            self._start_svo()
+            self._svo_pending = False
         self._record_step(action, obs, reward, terminated, truncated, info)
         self._maybe_flush(terminated, truncated)
         return obs, reward, terminated, truncated, info
