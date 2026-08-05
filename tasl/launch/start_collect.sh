@@ -16,15 +16,17 @@ source "$_DIR/lib.sh"
 
 ensure_root "$0" "$@"
 
-preflight_robot collect
-
+# Container first: the ZED probe and the reap both run via `docker exec`, so
+# preflight cannot come before the container is up.
 step "Backend: rlinf-eval container up"
 ensure_rlinf_container
 ok "rlinf-eval up"
 
-step "Reap stale collection processes in rlinf-eval"
-desk "docker exec rlinf-eval bash -lc 'pkill -9 -f \"[r]ay::DataCollector\"; pkill -9 -f \"[c]ollect_real_data\"; pkill -9 -f \"[P]olymetisController\"; /opt/venv/openpi/bin/ray stop --force 2>/dev/null; rm -rf /tmp/ray; true'"
+step "Reap stale collection processes in rlinf-eval (frees ZEDs + GELLO)"
+reap_collection_procs
 ok "clean slate"
+
+preflight_robot collect
 
 step "Stop any existing collect dashboard (idempotent re-run)"
 desk "pkill -TERM -f '[/_]collect[.]py' || true"

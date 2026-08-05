@@ -69,6 +69,24 @@ ensure_root() {
 # Runs a shell command line LOCALLY on the Desktop. In dry-run, just echoes it.
 desk() { if [[ -n "$LAUNCH_DRY_RUN" ]]; then echo "DRY: $*"; return 0; fi; eval "$*"; }
 
+# --- NUC1 ssh (key-based, works under sudo and from the dashboard) -----------
+# The bench key lives in the OPERATOR's ~/.ssh, but every launcher re-execs
+# under sudo, where $HOME is /root — so the operator's `Host FrankaNUC` config
+# block never applies and ssh silently falls back to an interactive password
+# prompt (and would HANG outright when called from the dashboard, which has no
+# tty). Point at the key by absolute path instead. Override with NUC1_SSH_KEY.
+NUC1_SSH_KEY="${NUC1_SSH_KEY:-$DESKTOP_HOME/.ssh/id_ed25519_frankanuc}"
+
+# nuc_ssh: run a command on NUC1. Allocates a tty only when we have one;
+# without a tty it goes BatchMode so a missing key fails fast and loudly
+# instead of blocking forever on a password prompt nobody can answer.
+nuc_ssh() {
+  local opts=(-o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new)
+  [[ -r "$NUC1_SSH_KEY" ]] && opts+=(-i "$NUC1_SSH_KEY" -o IdentitiesOnly=yes)
+  if [[ -t 0 && -t 1 ]]; then opts+=(-t); else opts+=(-o BatchMode=yes); fi
+  ssh "${opts[@]}" "$NUC1_SSH" "$@"
+}
+
 # --- rlinf-eval container: create with the canonical mounts, else (re)start ---
 # The bind mounts are the REAL source of truth for where in-container code +
 # data live, so they belong here in version control, not in a hand-run
@@ -188,6 +206,47 @@ zeds_free_or_reset() {
   return 1
 }
 
+# collection_procs_running: pids inside the container still holding the ZEDs +
+# GELLO — a live OR wedged collection. Empty output (rc 1) means nothing holds
+# them, which is what distinguishes a real USB wedge from a leftover run.
+collection_procs_running() {
+  if [[ -n "$LAUNCH_DRY_RUN" ]]; then
+    echo "DRY collection_procs probe"; [[ "${DRY_COLLECT_PROCS:-0}" == 1 ]]; return
+  fi
+  docker exec "$RLINF_CONTAINER" \
+    pgrep -f "[c]ollect_real_data|[r]ay::DataCollector|[P]olymetisController" \
+    2>/dev/null
+}
+
+# reap_collection_procs: THE definition of "free the ZEDs + GELLO". Shared by
+# teleop.sh / start_collect.sh / teleop-stop.sh so the kill set is fixed in one
+# place — it used to be copy-pasted into all three.
+reap_collection_procs() {
+  desk "docker exec $RLINF_CONTAINER bash -lc 'pkill -9 -f \"[r]ay::DataCollector\"; pkill -9 -f \"[c]ollect_real_data\"; pkill -9 -f \"[P]olymetisController\"; ${CONTAINER_RAY:-/opt/venv/openpi/bin/ray} stop --force >/dev/null 2>&1; rm -rf /tmp/ray; true' || true"
+  [[ -z "$LAUNCH_DRY_RUN" ]] && sleep 2
+  return 0
+}
+
+# ensure_zeds_free: get both ZEDs SDK-visible, telling apart the two causes that
+# look IDENTICAL from get_device_list() == []:
+#   (a) a live/wedged collection in the container still owns them  -> reap it
+#   (b) a post-hot-plug USB wedge, nothing holding them            -> usbreset
+# Diagnosing (a) as (b) is exactly what used to happen: a stale run would fail
+# the preflight with a "post-hot-plug USB wedge" message and send the operator
+# off to usbreset cameras that were simply still in use.
+ensure_zeds_free() {
+  zeds_free && { ok "ZEDs free"; return 0; }
+  local held
+  held="$(collection_procs_running || true)"
+  if [[ -n "$held" ]]; then
+    warn "ZEDs are held by an in-container collection (pids: $(tr '\n' ' ' <<<"$held")) — reaping it"
+    reap_collection_procs
+    zeds_free && { ok "ZEDs freed by reaping the stale collection"; return 0; }
+    warn "still not visible after the reap — trying a USB reset too"
+  fi
+  zeds_free_or_reset 2
+}
+
 # gpu_free: no compute process on the Desktop GPU (serve + training froze the box).
 gpu_free() {
   if [[ -n "$LAUNCH_DRY_RUN" ]]; then echo "DRY nvidia-smi compute-apps"; [[ "${DRY_GPU_FREE:-1}" == 1 ]]; return; fi
@@ -248,6 +307,9 @@ preflight_robot() {
   kill_other_dashboard "$me"
   ok "other dashboard stopped"
   step "Cameras: both ZEDs free ($ZED_EXTERIOR exterior, $ZED_WRIST wrist)"
-  zeds_free || die "ZED cameras not both free/present. Reseat the exterior 2i USB; make sure no dashboard or collection still holds them."
-  ok "ZEDs free"
+  ensure_zeds_free || die "ZED cameras still not visible to the SDK after reaping
+    in-container holders AND a USB reset. Escalate:
+      1. $TASL/launch/zed-check.sh          # confirm which serial is missing
+      2. physically unplug/replug the exterior ZED 2i, then re-run
+      3. reboot the Desktop (last resort)"
 }

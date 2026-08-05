@@ -32,7 +32,7 @@ ensure_root "$0" "$@"
 # ── Stage 1/4 — NUC1 controller backend (over robot net) ────────────────────
 step "Stage 1/4 — NUC1 backend over robot net ($NUC1_SSH)"
 if [[ -z "$LAUNCH_DRY_RUN" ]]; then
-  ssh -t "$NUC1_SSH" 'set -e
+  nuc_ssh 'set -e
     echo "[NUC1] stop franky robot_server (FCI exclusivity)"
     sudo systemctl stop franka-robot-server 2>/dev/null || true
     echo "[NUC1] bring up droid-nuc-fr3 polymetis container"
@@ -77,10 +77,14 @@ step "  rlinf-eval container up"
 ensure_rlinf_container
 step "  mutual exclusion: stop the other dashboard"
 kill_other_dashboard collect
+# Reap BEFORE probing the cameras: a leftover collect run holds the ZEDs, and
+# checking first made that look like a USB wedge and killed the launch here —
+# with the very step that would have fixed it sitting one line below.
+step "  reap stale collection procs in rlinf-eval (frees ZEDs + GELLO)"
+reap_collection_procs
 step "  cameras: both ZEDs free ($ZED_EXTERIOR exterior, $ZED_WRIST wrist)"
-zeds_free || die "ZEDs not both visible to the SDK. If no dashboard/collection holds them, it's usually a post-hot-plug USB wedge — run: $_DIR/zed-check.sh --reset  (then re-run). See zed-check.sh for escalation."
-step "  reap stale collection procs in rlinf-eval"
-desk "docker exec rlinf-eval bash -lc 'pkill -9 -f \"[r]ay::DataCollector\"; pkill -9 -f \"[c]ollect_real_data\"; pkill -9 -f \"[P]olymetisController\"; /opt/venv/openpi/bin/ray stop --force 2>/dev/null; rm -rf /tmp/ray; true'"
+ensure_zeds_free || die "ZEDs still not visible to the SDK after reaping holders
+  AND a USB reset. Escalate: $_DIR/zed-check.sh  →  replug the exterior ZED 2i  →  reboot."
 step "  stop any existing collect dashboard (idempotent)"
 desk "pkill -TERM -f '[/_]collect[.]py' || true"
 [[ -z "$LAUNCH_DRY_RUN" ]] && sleep 2

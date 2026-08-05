@@ -42,7 +42,7 @@ ensure_root "$0" "$@"
 # ── Stage 1/4 — NUC1 controller backend: polymetis container UP (over robot net) ─
 step "Stage 1/4 — NUC1 backend over robot net ($NUC1_SSH)"
 if [[ -z "$LAUNCH_DRY_RUN" ]]; then
-  ssh -t "$NUC1_SSH" 'set -e
+  nuc_ssh 'set -e
     echo "[NUC1] stop franky robot_server (FCI exclusivity)"
     sudo systemctl stop franka-robot-server 2>/dev/null || true
     echo "[NUC1] bring up droid-nuc-fr3 polymetis container"

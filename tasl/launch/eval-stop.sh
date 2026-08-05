@@ -36,7 +36,7 @@ desk "docker exec rlinf-eval bash -lc 'pkill -9 -f eval_embodied_agent.py; pkill
 # ── 3. NUC1 controller down over the robot net (releases FCI) ────────────────
 step "3/3 — bring NUC1 polymetis controller down ($NUC1_SSH) — releases FCI"
 if [[ -z "$LAUNCH_DRY_RUN" ]]; then
-  ssh -t "$NUC1_SSH" 'cd ~/polymetis_fr3 && docker compose down' \
+  nuc_ssh 'cd ~/polymetis_fr3 && docker compose down' \
     || warn "NUC1 teardown command failed (already down? ssh unreachable?) — verifying…"
   sleep 2
   if timeout 3 bash -c "cat < /dev/null > /dev/tcp/$NUC1_HOST/4242" 2>/dev/null; then
