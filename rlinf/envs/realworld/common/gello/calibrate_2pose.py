@@ -69,7 +69,7 @@ _PI2 = np.pi / 2
 HOME = [0.0, -0.6283, 0.0, -2.5133, 0.0, 1.8850, 0.0]
 TWIST = [1.00, -0.15, 0.90, -2.00, 0.90, 1.30, 0.90]
 POSE_A, POSE_B = HOME, TWIST
-MATCH_SECONDS = 20
+MATCH_SECONDS = 10
 VERIFY_TOL = 0.30
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "fr3_gello_config.py")
 
