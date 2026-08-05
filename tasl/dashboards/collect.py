@@ -89,6 +89,22 @@ try:
 except ImportError:
     HAS_CV2 = False
 
+# Layout store (stdlib-only, always importable). Two paths because the
+# launcher runs `python3 dashboards/collect.py` with PYTHONPATH=tasl (the
+# dashboards/openpi.py convention) while unit tests import it as a module.
+try:
+    from dashboards.layout_store import (
+        VIEWS as LAYOUT_VIEWS,
+        LayoutError, LayoutStore, dataset_layout_entry, is_usable_snapshot,
+        write_dataset_layout,
+    )
+except ImportError:  # pragma: no cover - direct run from inside dashboards/
+    from layout_store import (  # type: ignore[no-redef]
+        VIEWS as LAYOUT_VIEWS,
+        LayoutError, LayoutStore, dataset_layout_entry, is_usable_snapshot,
+        write_dataset_layout,
+    )
+
 _log = logging.getLogger("collect_dashboard")
 
 # ── Hardware constants (verified 2026-05-27) ─────────────────────────
@@ -106,6 +122,18 @@ CONTAINER_PY = "/opt/venv/openpi/bin/python"
 # the code checkout so swapping the mounted code never touches collected data.
 DATA_DIR_HOST = os.environ.get("RLINF_DATA_DIR", "/home/franka_desktop/rlinf_data")
 LIVE_CAM_DIR_HOST = f"{DATA_DIR_HOST}/outputs/live_cam"
+# Object-placement stencils (九宫格 + markers + reference snapshot), one
+# <id>.json (+ <id>.jpg) per layout. Kept beside the data, not in the code
+# checkout, for the same reason datasets are: a code swap must not lose them.
+LAYOUT_DIR_HOST = os.environ.get("RLINF_LAYOUT_DIR", f"{DATA_DIR_HOST}/layouts")
+# Operator launchers, next door to this file (<repo>/tasl/launch). The session
+# endpoints SHELL OUT to these rather than reimplementing the kill set in
+# Python: "stopped" has exactly one definition, and the portal cannot drift
+# from what teleop-stop.sh does on the command line.
+LAUNCH_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "launch")
+TELEOP_STOP_SH = os.path.join(LAUNCH_DIR, "teleop-stop.sh")
+LAUNCH_LIB_SH = os.path.join(LAUNCH_DIR, "lib.sh")
 # Start-gate sentinel the keyboard wrapper writes ("WAIT"/"RUN") inside the
 # container — Ray buffers actor stdout, so the dashboard reads this file
 # (docker exec cat) instead of parsing the log to drive the 开始下一条 button.
@@ -829,6 +857,21 @@ class CollectionManager:
             _log.info("collection stopped + cleaned up")
             return msg
 
+    def after_external_teardown(self) -> None:
+        """State fixup after the teardown SCRIPT killed the env behind our back.
+
+        Without this the manager keeps believing a run is live until the next
+        poll, and — worse — never reclaims the ZEDs, so the idle preview stays
+        dark after a 结束会话.
+        """
+        with self._lock:
+            self.last_result = parse_collect_log(self._tail_log())
+            self._was_running = False
+            self._launched_at = 0.0
+            self._reclaim_cameras()
+            self.last_action_msg = "session stopped via teleop-stop.sh"
+        _log.info("external teardown: manager state reset, cameras reclaimed")
+
     def status(self) -> dict:
         alive = self._is_alive()
         tail = self._tail_log()
@@ -838,9 +881,22 @@ class CollectionManager:
         # stdout buffering); fall back to log text if the file read fails.
         gate = self._read_gate()
         if gate is not None:
+            # WAIT = homed, arm frozen, waiting to be released.
+            # LIVE = released for positioning, teleop live but NOT recording
+            #        (two-stage gate only; one-stage goes WAIT -> RUN).
+            # RUN  = recording.
             waiting_for_start = bool(alive and gate == "WAIT")
+            robot_released = bool(alive and gate == "LIVE")
         else:
             waiting_for_start = bool(alive and is_waiting_for_start(tail))
+            robot_released = False
+        # Orphan = a run this dashboard never launched. Happens when the
+        # dashboard is restarted (or crashes) under a live collection: the run
+        # keeps the ZEDs + GELLO, and the next launcher preflight then fails on
+        # cameras that look wedged. Surfacing it gives the operator a one-click
+        # way out instead of a docker exec.
+        with self._lock:
+            orphan = bool(alive and self._launched_at == 0.0)
         with self._lock:
             if self._was_running and not alive:
                 # A poll once raced a fresh start(): its pre-lock alive=False
@@ -862,6 +918,8 @@ class CollectionManager:
             **parsed,
             "startup": startup,
             "waiting_for_start": waiting_for_start,
+            "robot_released": robot_released,
+            "orphan": orphan,
             "last_result": self.last_result,
             "last_launch": self.last_launch,
             "last_action_msg": self.last_action_msg,
@@ -1377,8 +1435,11 @@ class VirtualKeyboard:
         self._ecodes = ecodes
         # A/B/C/Q satisfy the listener's device-detection caps; S is the
         # episode-start key. All injectable.
+        # KEY_R drives the two-stage start gate's second step (begin
+        # recording). Superset of the {A,B,C,Q} caps KeyboardListener matches
+        # on, so device selection is unaffected.
         caps = {ecodes.EV_KEY: [ecodes.KEY_A, ecodes.KEY_B, ecodes.KEY_C,
-                                ecodes.KEY_Q, ecodes.KEY_S]}
+                                ecodes.KEY_Q, ecodes.KEY_S, ecodes.KEY_R]}
         self._ui = UInput(caps, name=VIRTUAL_KBD_NAME)  # needs /dev/uinput (root)
         dev = getattr(self._ui, "device", None)
         self.path: Optional[str] = dev.path if dev is not None else None
@@ -1402,6 +1463,19 @@ class VirtualKeyboard:
     def inject_success(self, hold_s: float = 0.25) -> None:
         """Inject 'c' = label current episode success + done."""
         self.inject_key(self._ecodes.KEY_C, hold_s)
+
+    def inject_record(self, hold_s: float = 0.25) -> None:
+        """Begin recording — second step of the two-stage start gate."""
+        self.inject_key(self._ecodes.KEY_R, hold_s)
+
+    def inject_discard(self, hold_s: float = 0.25) -> None:
+        """End the episode WITHOUT saving it (reward -1 + done).
+
+        The cheapest way to 'delete' a bad episode is never to write it: with
+        only_success the run drops it, so nothing has to be renumbered out of a
+        dataset that LeRobot is still holding open.
+        """
+        self.inject_key(self._ecodes.KEY_A, hold_s)
 
     def inject_start(self, hold_s: float = 0.25) -> None:
         """Inject 's' = start the next episode (release the wait-for-start gate)."""
@@ -1578,6 +1652,142 @@ class DroidClient:
 # ─────────────────────────────────────────────────────────────────────
 # Flask app
 # ─────────────────────────────────────────────────────────────────────
+class LayoutGate:
+    """layout-prepare stage: which stencil is armed, and is the scene ready.
+
+    Collection is gated on the operator having (a) selected a layout and
+    (b) confirmed the physical objects match it. One confirmation covers a
+    whole run — every episode in a run shares the arrangement — and is
+    invalidated if the stencil itself is edited underneath (hash change) or
+    the operator backs out.
+
+    Also carries the dataset provenance write. `meta/layout.json` cannot be
+    written at Start for a brand-new dataset (LeRobotDataset.create refuses a
+    non-empty target), so the entry is parked here and flushed by the status
+    poll once the dataset directory actually exists.
+    """
+
+    def __init__(self, store: "LayoutStore"):
+        self.store = store
+        self._lock = threading.Lock()
+        self._layout: Optional[dict] = None
+        self._confirmed_at: Optional[float] = None
+        self._pending: Optional[tuple] = None   # (dataset_dir, entry)
+        self._last_write: Optional[str] = None
+
+    # -- selection / confirmation -------------------------------------
+    def select(self, layout_id: str) -> dict:
+        """Arm a layout. Always drops any prior confirmation — a new stencil
+        means the scene has not been checked against it yet."""
+        layout = self.store.load(layout_id)
+        with self._lock:
+            self._layout = layout
+            self._confirmed_at = None
+        return layout
+
+    def refresh(self) -> None:
+        """Re-read the armed layout from disk; drop confirmation if the
+        stencil moved. Called after a save so nudging a marker while
+        'confirmed' cannot smuggle a stale confirmation into a run."""
+        with self._lock:
+            cur = self._layout
+        if not cur:
+            return
+        try:
+            fresh = self.store.load(cur["id"])
+        except LayoutError:
+            with self._lock:
+                self._layout = None
+                self._confirmed_at = None
+            return
+        with self._lock:
+            if self._layout and self._layout["id"] == fresh["id"]:
+                if fresh["hash"] != self._layout["hash"]:
+                    self._confirmed_at = None
+                self._layout = fresh
+
+    def confirm(self) -> str:
+        with self._lock:
+            if not self._layout:
+                raise LayoutError("no layout selected — pick or create one first")
+            self._confirmed_at = time.time()
+            return self._layout["id"]
+
+    def clear(self) -> None:
+        with self._lock:
+            self._layout = None
+            self._confirmed_at = None
+
+    def unconfirm(self) -> None:
+        with self._lock:
+            self._confirmed_at = None
+
+    def check(self) -> tuple[bool, str]:
+        """Gate for /api/collect/start."""
+        with self._lock:
+            if not self._layout:
+                return False, ("refused: layout-prepare 未完成 — 请先选择或新建一个 "
+                               "layout")
+            if not self._confirmed_at:
+                return False, (f"refused: layout '{self._layout['id']}' 已选择但未确认 "
+                               "— 摆好物体后点「确认就位」")
+            return True, self._layout["id"]
+
+    def current(self) -> Optional[dict]:
+        with self._lock:
+            return dict(self._layout) if self._layout else None
+
+    def status(self) -> dict:
+        with self._lock:
+            lay = self._layout
+            return {
+                "selected": lay["id"] if lay else None,
+                "hash": lay["hash"] if lay else None,
+                # One layout, two views — the exterior stencil pins the object
+                # placement, the wrist (eye-in-hand) one pins the start pose.
+                "views": lay["views"] if lay else None,
+                "has_snapshot": lay["has_snapshot"] if lay else {},
+                "confirmed": self._confirmed_at is not None,
+                "confirmed_at": (
+                    time.strftime("%H:%M:%S", time.localtime(self._confirmed_at))
+                    if self._confirmed_at else None),
+                "pending_write": self._pending is not None,
+                "last_write": self._last_write,
+            }
+
+    # -- dataset provenance -------------------------------------------
+    def arm_dataset_write(self, dataset_dir: str, task: str,
+                          num_episodes: int) -> None:
+        layout = self.current()
+        if not layout:
+            return
+        entry = dataset_layout_entry(layout, task, num_episodes)
+        with self._lock:
+            self._pending = (dataset_dir, entry)
+        self.flush_pending()   # datasets that already exist get it immediately
+
+    def flush_pending(self) -> Optional[str]:
+        """Write the parked entry once the dataset dir exists. Cheap enough
+        (one isdir) to call from the 1.5 s status poll."""
+        with self._lock:
+            pending = self._pending
+        if not pending:
+            return None
+        dataset_dir, entry = pending
+        if not os.path.isdir(dataset_dir):
+            return None
+        try:
+            path = write_dataset_layout(dataset_dir, entry)
+        except OSError as e:
+            _log.warning(f"layout metadata write failed for {dataset_dir}: {e}")
+            return None
+        with self._lock:
+            self._pending = None
+            self._last_write = path
+        _log.info(f"layout provenance written: {path}")
+        return path
+
+
 INDEX_HTML = """<!doctype html>
 <html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -1615,6 +1825,16 @@ INDEX_HTML = """<!doctype html>
   button.startep { display: none; width: 100%; padding: 26px 0;
          font-size: 1.5rem; font-weight: 600; margin-top: 12px;
          background: #1565c0; border-radius: 10px; }
+  /* Amber, deliberately NOT green: the robot is live but nothing is being
+     recorded yet — the operator must still act. */
+  button.startrec { display: none; width: 100%; padding: 26px 0;
+         font-size: 1.5rem; font-weight: 600; margin-top: 12px;
+         background: #a35b00; border-radius: 10px; }
+  /* Deliberately smaller than 标记成功: discarding is the rarer action, and a
+     mis-hit costs the whole take. */
+  button.discardep { display: none; width: 100%; padding: 12px 0;
+         font-size: 1rem; margin-top: 8px;
+         background: #4a1f1f; border-radius: 8px; }
   table { font-size: 0.9rem; border-collapse: collapse; }
   td, th { padding: 4px 8px; border-bottom: 1px solid #2a2a2a;
            text-align: left; vertical-align: top; }
@@ -1642,6 +1862,60 @@ INDEX_HTML = """<!doctype html>
   #playOverlay img { image-rendering: pixelated; border: 1px solid #444;
          border-radius: 4px; max-width: 92vw; max-height: 80vh; }
   #playTitle { color: #ccc; font-size: 0.9rem; margin-bottom: 8px; }
+  /* ---- layout stencil overlay (exterior cam) ---------------------- */
+  /* The stencil is composited in the BROWSER, never burned into the MJPEG
+     stream — recorded frames stay clean and toggling costs nothing. */
+  .camwrap { position: relative; display: block; width: 100%;
+             max-width: 480px; line-height: 0; }
+  .camwrap img.feed { width: 100%; display: block; border-radius: 4px; }
+  /* NB: no `display:none` here — these are toggled from JS with
+     style.display = '' , which only strips the INLINE style and would fall
+     straight back to a stylesheet rule. Hidden state lives inline in the
+     markup instead, matching how every other JS-toggled element here works. */
+  .camwrap img.ghost { position: absolute; left: 0; top: 0;
+             width: 100%; height: 100%; border-radius: 4px;
+             pointer-events: none; }
+  .camwrap .stencil { position: absolute; left: 0; top: 0;
+             width: 100%; height: 100%;
+             pointer-events: none; }
+  /* Only edit mode swallows clicks — a live preview stays click-through. */
+  .camwrap.editing .stencil { pointer-events: auto; cursor: crosshair; }
+  .gline { position: absolute; background: rgba(120,200,255,0.35); }
+  .gline.v { top: 0; height: 100%; width: 1px; }
+  .gline.h { left: 0; width: 100%; height: 1px; }
+  .mk { position: absolute; transform: translate(-50%, -50%);
+        width: 14px; height: 14px; border-radius: 50%;
+        border: 2px solid #ffb300; background: rgba(255,179,0,0.25);
+        box-sizing: border-box; }
+  .mk.sel { border-color: #4fc3f7; background: rgba(79,195,247,0.35);
+        box-shadow: 0 0 0 3px rgba(79,195,247,0.25); }
+  .mk .mklabel { position: absolute; left: 18px; top: -4px;
+        white-space: nowrap; font-size: 11px; line-height: 1.4;
+        color: #ffe08a; text-shadow: 0 0 3px #000, 0 0 3px #000;
+        font-family: monospace; }
+  .mk.sel .mklabel { color: #9fe0ff; }
+  #layout-panel .kbdhint { font-size: 0.78rem; color: #888; margin-top: 8px;
+        line-height: 1.8; }
+  kbd { background: #262626; border: 1px solid #3a3a3a; border-radius: 3px;
+        padding: 1px 5px; font-family: monospace; font-size: 0.78rem;
+        color: #ddd; }
+  .lstate { font-size: 0.8rem; padding: 2px 8px; border-radius: 10px;
+        margin-left: 8px; vertical-align: middle; }
+  .lstate.none { background: #3a2323; color: #e59a9a; }
+  .lstate.sel  { background: #3a3423; color: #e5cf8a; }
+  .lstate.ok   { background: #1f4f1f; color: #a5e5a5; }
+  .objrow { display: flex; align-items: center; gap: 6px; padding: 3px 0;
+        font-size: 0.85rem; border-bottom: 1px solid #222; cursor: pointer; }
+  .objrow.sel { background: #17242c; }
+  .objrow .coord { color: #777; font-family: monospace; font-size: 0.78rem; }
+  .objrow .idx { color: #666; font-family: monospace; width: 18px; }
+  #sessionOut { background: #0b0b0b; border: 1px solid #262626;
+        border-radius: 4px; padding: 8px; margin-top: 8px; max-height: 240px;
+        overflow: auto; font-size: 0.75rem; line-height: 1.5; color: #bbb;
+        white-space: pre-wrap; word-break: break-all; }
+  .warnbox { background: #3a2323; border: 1px solid #5a3030; color: #e5b0b0;
+        padding: 8px 10px; border-radius: 4px; font-size: 0.85rem;
+        line-height: 1.6; margin-bottom: 8px; }
 </style></head>
 <body>
 <h1>TASL FR3 — 数据采集 dashboard</h1>
@@ -1651,9 +1925,13 @@ INDEX_HTML = """<!doctype html>
     <h3>状态</h3>
     <div id="status">loading...</div>
     <button id="startEpBtn" class="startep"
-            onclick="markStartEpisode()">开始下一条 (注入 's')</button>
+            onclick="markStartEpisode()">① 放行机械臂 (注入 's')</button>
+    <button id="startRecBtn" class="startrec"
+            onclick="markStartRecording()">② 开始记录 (注入 'r')</button>
     <button id="markSuccessBtn" class="marksuccess"
-            onclick="markSuccess()">标记成功 (注入 'c')</button>
+            onclick="markSuccess()">③ 标记成功 (注入 'c')</button>
+    <button id="discardEpBtn" class="discardep"
+            onclick="markDiscard()">✗ 丢弃本条 (注入 'a')</button>
   </div>
   <div class="col ctl">
     <h3>采集控制</h3>
@@ -1668,7 +1946,8 @@ INDEX_HTML = """<!doctype html>
     <label>任务描述 (语言指令)</label>
     <input type="text" id="taskDesc" value="pick up the cube"/>
     <div>
-      <button class="primary" onclick="startCollect()">Start</button>
+      <button class="primary" id="btnStart" onclick="startCollect()"
+              disabled title="需要先完成 Layout 准备并「确认就位」">Start</button>
       <button class="danger" onclick="stopCollect()">Stop</button>
     </div>
     <div id="actionMsg" style="font-size:0.8rem;color:#888;margin-top:8px"></div>
@@ -1676,14 +1955,114 @@ INDEX_HTML = """<!doctype html>
 </div>
 
 <div class="row" style="margin-top:16px">
+  <div class="col ctl" id="layout-panel" style="flex:1 1 100%">
+    <h3>Layout 准备（物体摆位）<span id="layoutState"
+        class="lstate none">未选择</span></h3>
+
+    <div id="camCtl" style="margin-bottom:10px; padding-bottom:10px;
+         border-bottom:1px solid #262626">
+      <button id="btnCamOn" onclick="camPreview(true)">▶ 开启相机预览</button>
+      <button id="btnCamOff" onclick="camPreview(false)">■ 关闭预览</button>
+      <span id="camState" style="font-size:0.82rem; color:#888; margin-left:8px"></span>
+      <div style="font-size:0.78rem;color:#777;margin-top:6px;line-height:1.6">
+        摆位/标定 layout 需要实时画面。预览由 dashboard 持有 ZED；按 Start 时会自动释放，
+        并等到容器内确认能打开相机后才启动采集（几秒）。
+      </div>
+    </div>
+
+    <div id="layoutPick">
+      <label>加载已有 layout</label>
+      <div style="display:flex; gap:6px; align-items:center">
+        <select id="layoutSel" style="flex:1; margin-bottom:0"></select>
+        <button class="small" onclick="layoutLoad()">加载</button>
+        <button class="small danger" onclick="layoutDelete()">删除</button>
+      </div>
+      <button class="primary" onclick="layoutNew()">＋ 新建 Layout</button>
+      <button onclick="layoutEditCurrent()">编辑当前</button>
+    </div>
+
+    <div id="layoutEditor" style="display:none">
+      <label>Layout 名称（字母/数字/._-）</label>
+      <input type="text" id="layoutName" placeholder="如 stackcube_3x3_v1"/>
+      <label>正在编辑哪个相机（两个 view 共同定义一个 layout，标记互相独立）</label>
+      <div>
+        <button class="small" id="tabExterior" onclick="setEditView('exterior')">
+          外部 (物体摆位)</button>
+        <button class="small" id="tabWrist" onclick="setEditView('wrist')">
+          腕部 EIH (起始位姿)</button>
+      </div>
+      <div style="display:flex; gap:10px">
+        <div style="flex:1"><label>网格 行</label>
+          <input type="number" id="gridRows" value="3" min="1" max="12"
+                 onchange="onGridChange()"/></div>
+        <div style="flex:1"><label>网格 列</label>
+          <input type="number" id="gridCols" value="3" min="1" max="12"
+                 onchange="onGridChange()"/></div>
+      </div>
+      <label>物体标记 — 添加 → 移到位 → 确定，一个一个来</label>
+      <div id="objList" style="max-height:170px; overflow:auto;
+           border:1px solid #262626; border-radius:4px; padding:4px 8px"></div>
+      <div>
+        <button class="small" onclick="objAdd()">① ＋ 添加物体(中心)</button>
+        <button class="small primary" onclick="objCommit()">② ✓ 确定此物体</button>
+        <button class="small" onclick="objRename()">重命名</button>
+        <button class="small danger" onclick="objDelete()">删除选中</button>
+      </div>
+      <div class="kbdhint">
+        <b style="color:#999">移动选中的物体：</b>鼠标直接拖 · 点画面空白处跳过去 ·
+        <kbd>←</kbd> <kbd>→</kbd> <kbd>↑</kbd> <kbd>↓</kbd> 微调
+        （<kbd>Shift</kbd> 粗调 10× · <kbd>Alt</kbd> 精调）<br>
+        <kbd>Tab</kbd> 切换下一个 · <kbd>Del</kbd> 删除 · <kbd>Esc</kbd> 退出编辑 ·
+        确定后再点空白处会开始<b>新的</b>物体
+      </div>
+      <div>
+        <button class="primary" onclick="layoutSave(VIEWS)">保存 + 抓两个快照</button>
+        <button onclick="layoutSave([editView])">保存 + 只抓当前 view 快照</button>
+        <button onclick="layoutSave([])">仅保存标记</button>
+        <button onclick="layoutCancelEdit()">取消</button>
+      </div>
+    </div>
+
+    <div id="layoutView" style="display:none">
+      <div style="display:flex; gap:18px; flex-wrap:wrap; align-items:center">
+        <label style="margin:0; display:inline">
+          <input type="checkbox" id="showGrid" checked onchange="drawStencil()"/>
+          显示网格+标记</label>
+        <label style="margin:0; display:inline">
+          <input type="checkbox" id="showGhost" checked onchange="drawStencil()"/>
+          显示参考快照</label>
+        <div style="flex:1; min-width:200px">
+          <label style="margin:0">ghost 透明度 <span id="ghostVal">45%</span></label>
+          <input type="range" id="ghostOp" min="0" max="100" value="45"
+                 oninput="drawStencil()" style="width:100%"/>
+        </div>
+      </div>
+      <button class="primary" onclick="layoutConfirm()">✓ 确认就位（解锁 Start）</button>
+      <button onclick="layoutClear()">取消选择</button>
+    </div>
+    <div id="layoutMsg" style="font-size:0.8rem;color:#888;margin-top:8px"></div>
+  </div>
+</div>
+
+<div class="row" style="margin-top:16px">
   <div class="col cam">
-    <div class="label">exterior (ZED 2i)</div>
-    <img id="cam-exterior" alt="exterior"/>
+    <div class="label">exterior (ZED 2i)<span id="layoutBadge"></span></div>
+    <div class="camwrap" id="camwrap-exterior">
+      <img id="cam-exterior" class="feed" alt="exterior"/>
+      <img id="ghost-exterior" class="ghost" alt="layout reference"
+           style="display:none"/>
+      <div id="stencil-exterior" class="stencil" style="display:none"></div>
+    </div>
     <div id="ph-exterior" class="placeholder" style="display:none"></div>
   </div>
   <div class="col cam">
-    <div class="label">wrist (ZED Mini)</div>
-    <img id="cam-wrist" alt="wrist"/>
+    <div class="label">wrist (ZED Mini, eye-in-hand)<span id="layoutBadgeW"></span></div>
+    <div class="camwrap" id="camwrap-wrist">
+      <img id="cam-wrist" class="feed" alt="wrist"/>
+      <img id="ghost-wrist" class="ghost" alt="layout reference"
+           style="display:none"/>
+      <div id="stencil-wrist" class="stencil" style="display:none"></div>
+    </div>
     <div id="ph-wrist" class="placeholder" style="display:none"></div>
   </div>
 </div>
@@ -1700,6 +2079,22 @@ INDEX_HTML = """<!doctype html>
     </div>
     <div id="robotMsg" style="font-size:0.8rem;color:#888;margin-top:8px"></div>
   </div>
+  <div class="col ctl" id="session-panel">
+    <h3>会话 / 硬件释放</h3>
+    <div id="orphanWarn" class="warnbox" style="display:none"></div>
+    <div style="font-size:0.82rem;color:#8d8d8d;line-height:1.75">
+      <b style="color:#bbb">清理残留</b> — 杀掉容器内的采集进程，释放 ZED + GELLO。
+      <u>不动 FCI</u>，可以直接重开下一条。<br>
+      <b style="color:#bbb">结束会话</b> — 跑 <code>teleop-stop.sh</code> 全套：再额外关掉
+      NUC 控制器、<b>释放 FCI</b>。收工时用。
+    </div>
+    <div>
+      <button onclick="sessionReap()">清理残留进程</button>
+      <button class="danger" onclick="sessionStop()">结束会话 (释放 FCI)</button>
+    </div>
+    <div id="sessionMsg" style="font-size:0.8rem;color:#888;margin-top:8px"></div>
+    <pre id="sessionOut" style="display:none"></pre>
+  </div>
 </div>
 <div class="row" style="margin-top:16px">
   <div class="col ctl" id="dataset-panel">
@@ -1714,6 +2109,16 @@ INDEX_HTML = """<!doctype html>
 <div id="playOverlay">
   <div id="playTitle"></div>
   <img id="playImg" alt="episode playback"/>
+  <div id="playSpeeds" style="margin-top:8px">
+    <span style="color:#999;font-size:0.82rem;margin-right:6px">倍速</span>
+    <button class="small" data-s="0.5" onclick="setPlaySpeed(0.5)">0.5×</button>
+    <button class="small primary" data-s="1" onclick="setPlaySpeed(1)">1×</button>
+    <button class="small" data-s="2" onclick="setPlaySpeed(2)">2×</button>
+    <button class="small" data-s="4" onclick="setPlaySpeed(4)">4×</button>
+    <button class="small" data-s="8" onclick="setPlaySpeed(8)">8×</button>
+    <span style="color:#666;font-size:0.75rem;margin-left:10px">
+      改倍速会从头重放</span>
+  </div>
   <div><button onclick="closePlayback()">关闭</button></div>
 </div>
 
@@ -1739,7 +2144,9 @@ function setCams(running, collecting) {
     } else {
       img.removeAttribute('src');
       img.style.display = 'none';
-      ph.textContent = '采集未运行 — 相机空闲';
+      // Actionable, not just a statement of fact: the preview is opt-in, so
+      // "idle" is a state the operator can leave from right here.
+      ph.textContent = '相机空闲 — 点 Layout 面板里的「▶ 开启相机预览」看实时画面';
       ph.style.display = '';
     }
   }
@@ -1804,6 +2211,10 @@ async function startCollect() {
     alert('数据集名只能含 字母/数字/._-'); return;
   }
   if (!task) { alert('任务描述不能为空'); return; }
+  if (!LAY.confirmed) {
+    alert('Layout 准备未完成 — 请先选择/新建 layout，摆好物体后点「确认就位」');
+    return;
+  }
   return api('/api/collect/start',
              {num_episodes: n, task_description: task, dataset_name: ds});
 }
@@ -1827,6 +2238,65 @@ async function markStartEpisode() {
     document.getElementById('actionMsg').textContent =
       (j.msg || '') + ' — ' + j.caveat;
   }
+}
+
+async function markStartRecording() {
+  const j = await api('/api/start_recording');
+  if (j && j.caveat) {
+    document.getElementById('actionMsg').textContent =
+      (j.msg || '') + ' — ' + j.caveat;
+  }
+}
+
+async function markDiscard() {
+  if (!confirm('丢弃本条？\\n\\n这一条不会保存，机械臂会复位重来。\\n'
+      + '（比录完再删安全：数据集里根本不会出现它）')) return;
+  const j = await api('/api/discard_episode');
+  if (j && j.caveat) {
+    document.getElementById('actionMsg').textContent =
+      (j.msg || '') + ' — ' + j.caveat;
+  }
+}
+
+// ── session teardown ────────────────────────────────────────────────
+async function sessionApi(path) {
+  const msg = document.getElementById('sessionMsg');
+  const out = document.getElementById('sessionOut');
+  msg.textContent = '执行中…（NUC ssh 这步可能要十几秒）';
+  out.style.display = 'none';
+  try {
+    const r = await fetch(path, {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}',
+    });
+    const j = await r.json();
+    msg.textContent = j.msg || JSON.stringify(j);
+    if (j.output) { out.textContent = j.output; out.style.display = ''; }
+    refresh();
+    return j;
+  } catch (e) {
+    msg.textContent = '请求失败: ' + e;
+  }
+}
+
+// NOTE: INDEX_HTML is a plain (non-raw) Python string, so every backslash is
+// consumed by PYTHON before the browser ever sees it. A newline escape must be
+// written DOUBLED in the source; written singly it becomes a real line break
+// inside the JS string literal, which terminates the string and takes the
+// entire <script> block down with it — every panel then sits on "loading...".
+async function sessionReap() {
+  if (!confirm('清理容器内的采集进程？\\n\\n'
+      + '• 释放 ZED 相机 + GELLO\\n'
+      + '• 正在进行的采集会被终止，未保存的 episode 丢失\\n'
+      + '• FCI / NUC 控制器不受影响，可以直接重开')) return;
+  return sessionApi('/api/session/reap');
+}
+
+async function sessionStop() {
+  if (!confirm('结束整个会话？(teleop-stop.sh)\\n\\n'
+      + '• 杀掉容器内采集进程 → 释放相机 + GELLO\\n'
+      + '• 关掉 NUC 控制器 → 释放 FCI\\n\\n'
+      + '之后要再采集，必须重新跑 teleop.sh 并在 Desk 里重新激活 FCI。')) return;
+  return sessionApi('/api/session/stop');
 }
 
 async function robotApi(path) {
@@ -1865,14 +2335,34 @@ function esc(s) {
 }
 
 function renderRobot(j, running) {
-  const waiting = !!(j.collection && j.collection.waiting_for_start);
-  // Waiting at the start gate: show 开始下一条; mid-episode: show 标记成功.
+  const coll = j.collection || {};
+  const waiting = !!coll.waiting_for_start;
+  const released = !!coll.robot_released;
+  // Exactly one big button per gate state: WAIT -> 放行机械臂,
+  // LIVE -> 开始记录, RUN -> 标记成功.
   document.getElementById('startEpBtn').style.display =
     waiting ? 'block' : 'none';
+  document.getElementById('startRecBtn').style.display =
+    released ? 'block' : 'none';
+  const midEpisode = running && !waiting && !released;
   document.getElementById('markSuccessBtn').style.display =
-    (running && !waiting) ? 'block' : 'none';
+    midEpisode ? 'block' : 'none';
+  // Discard shares the mid-episode state: the two ways an episode can end.
+  document.getElementById('discardEpBtn').style.display =
+    midEpisode ? 'block' : 'none';
   for (const id of ['btnHome', 'btnRecover', 'btnGripOpen', 'btnGripClose']) {
     document.getElementById(id).disabled = !!running;
+  }
+  // Orphaned run: it owns the ZEDs + GELLO, so the next teleop.sh preflight
+  // will fail on "cameras" unless it is reaped first.
+  const ow = document.getElementById('orphanWarn');
+  if (coll.orphan) {
+    ow.style.display = '';
+    ow.innerHTML = '⚠ 检测到一个<b>不是本 dashboard 启动</b>的采集进程正在运行'
+      + '（dashboard 重启过？）。它占着 ZED + GELLO，会让下次 teleop.sh 的'
+      + '相机检查失败 —— 按「清理残留进程」清掉。';
+  } else {
+    ow.style.display = 'none';
   }
   const rs = document.getElementById('robotState');
   if (running) {
@@ -1892,6 +2382,503 @@ function renderRobot(j, running) {
   }
 }
 
+// ── layout-prepare ──────────────────────────────────────────────────
+// The stencil is composited client-side over the exterior feed: grid lines
+// and markers are absolutely-positioned divs in percent coordinates, so they
+// track the preview at any size without any aspect-ratio math, and the ghost
+// is just the reference JPEG at a chosen opacity.
+const VIEWS = ['exterior', 'wrist'];
+let LAY = {};            // server gate state, from /api/status
+let layEditing = false;  // authoring/editing a stencil
+let draft = null;        // {views: {exterior:{grid,objects}, wrist:{...}}, ...}
+let editView = 'exterior';  // which camera the editor is acting on
+let selIdx = -1;         // selected marker index WITHIN editView
+let layCache = [];
+
+function draftView(v) { return draft ? draft.views[v || editView] : null; }
+
+function clamp01(v) { return Math.min(1, Math.max(0, v)); }
+function layMsg(t) { document.getElementById('layoutMsg').textContent = t; }
+
+async function camPreview(on) {
+  layMsg(on ? '正在打开 ZED…' : '正在释放 ZED…');
+  const j = await layApi(on ? '/api/cams/start' : '/api/cams/stop');
+  if (j && j.missing_cams && j.missing_cams.length) {
+    layMsg('打开失败的相机: ' + JSON.stringify(j.missing_cams));
+  }
+  camsShown = null;   // force setCams to re-sync the <img> sources
+  refresh();
+}
+
+function renderCamCtl(camRunning, collecting) {
+  const on = document.getElementById('btnCamOn');
+  const off = document.getElementById('btnCamOff');
+  const st = document.getElementById('camState');
+  if (!on) return;
+  on.disabled = camRunning || collecting;
+  off.disabled = !camRunning || collecting;
+  if (collecting) {
+    st.innerHTML = '<span class="dot ok"></span>采集中 — 相机由 env 持有';
+  } else if (camRunning) {
+    st.innerHTML = '<span class="dot ok"></span>预览开启中 (dashboard 持有 ZED)';
+  } else {
+    st.innerHTML = '<span class="dot idle"></span>相机空闲 — 无实时画面';
+  }
+}
+
+async function layApi(path, body, method) {
+  try {
+    const opt = {method: method || 'POST',
+                 headers: {'Content-Type': 'application/json'}};
+    if (opt.method !== 'DELETE') opt.body = JSON.stringify(body || {});
+    const r = await fetch(path, opt);
+    const j = await r.json();
+    layMsg(j.msg || JSON.stringify(j));
+    return j;
+  } catch (e) { layMsg('请求失败: ' + e); return {ok: false}; }
+}
+
+async function loadLayoutList() {
+  try {
+    const r = await fetch('/api/layouts');
+    const j = await r.json();
+    layCache = j.layouts || [];
+    const sel = document.getElementById('layoutSel');
+    const prev = sel.value;
+    sel.innerHTML = layCache.length
+      ? layCache.map(function (l) {
+          if (l.error) return '<option value="' + esc(l.id) + '">'
+                             + esc(l.id) + '  (损坏)</option>';
+          const n = l.n_objects || {};
+          const snap = l.has_snapshot || {};
+          const shots = VIEWS.filter(function (v) { return snap[v]; });
+          return '<option value="' + esc(l.id) + '">' + esc(l.id)
+            + '  — 外部 ' + (n.exterior || 0) + ' / 腕部 ' + (n.wrist || 0)
+            + (shots.length ? ' · 快照 ' + shots.join('+') : '')
+            + '</option>';
+        }).join('')
+      : '<option value="">(还没有 layout — 点「新建」)</option>';
+    if (layCache.some(l => l.id === prev)) sel.value = prev;
+  } catch (e) { layMsg('layout 列表加载失败: ' + e); }
+}
+
+// What to draw over ONE camera. Editing shows the draft; otherwise the armed
+// layout. The two views are independent: the cameras see completely different
+// geometry, so a marker in one has no counterpart in the other.
+function stencilFor(view) {
+  if (layEditing && draft) {
+    const d = draft.views[view];
+    return {grid: d.grid, objects: d.objects,
+            ghostId: draft.snapId, ghostVer: draft.ghostVer,
+            hasSnap: !!(draft.hasSnap || {})[view]};
+  }
+  if (LAY.selected && LAY.views) {
+    const d = LAY.views[view] || {};
+    return {grid: d.grid, objects: d.objects || [],
+            ghostId: LAY.selected, ghostVer: LAY.hash,
+            hasSnap: !!(LAY.has_snapshot || {})[view]};
+  }
+  return null;
+}
+
+function setEditView(v) {
+  editView = v;
+  selIdx = -1;                    // marker indices are per-view
+  const d = draftView();
+  if (d) {
+    document.getElementById('gridRows').value = d.grid.rows;
+    document.getElementById('gridCols').value = d.grid.cols;
+  }
+  document.getElementById('tabExterior').className =
+    'small' + (v === 'exterior' ? ' primary' : '');
+  document.getElementById('tabWrist').className =
+    'small' + (v === 'wrist' ? ' primary' : '');
+  layMsg(v === 'exterior'
+    ? '编辑「外部」view — 标物体该摆在哪'
+    : '编辑「腕部 EIH」view — 标 episode 起始时夹爪该看到什么');
+  drawStencil(); renderObjList();
+}
+
+function drawStencil() { VIEWS.forEach(drawOneView); }
+
+function drawOneView(view) {
+  const wrap = document.getElementById('camwrap-' + view);
+  const sten = document.getElementById('stencil-' + view);
+  const ghost = document.getElementById('ghost-' + view);
+  if (!wrap || !sten || !ghost) return;
+  // Only the view being edited takes mouse input, so a stray click on the
+  // other camera can never drop a marker into the wrong view.
+  wrap.classList.toggle('editing', layEditing && view === editView);
+  const a = stencilFor(view);
+  if (!a) {
+    sten.style.display = 'none'; sten.innerHTML = '';
+    ghost.style.display = 'none'; ghost.removeAttribute('src');
+    ghost.dataset.key = '';
+    return;
+  }
+  const cbGrid = document.getElementById('showGrid');
+  const cbGhost = document.getElementById('showGhost');
+  const opEl = document.getElementById('ghostOp');
+  const valEl = document.getElementById('ghostVal');
+  if (valEl && opEl) valEl.textContent = opEl.value + '%';
+  // While editing, the stencil is always on — you cannot place what you
+  // cannot see; the checkboxes only govern the view/confirm step.
+  const wantGrid = layEditing || !cbGrid || cbGrid.checked;
+  const wantGhost = a.hasSnap && !!a.ghostId && (!cbGhost || cbGhost.checked);
+
+  if (wantGhost) {
+    // Cache-bust on the stencil hash: re-saving a layout overwrites the JPEG
+    // in place, and a cached ghost would be aligned to the old arrangement.
+    const key = '/api/layout/' + encodeURIComponent(a.ghostId)
+              + '/snapshot/' + view + '.jpg?v='
+              + encodeURIComponent(a.ghostVer || '');
+    if (ghost.dataset.key !== key) { ghost.src = key; ghost.dataset.key = key; }
+    ghost.style.opacity = opEl ? (parseInt(opEl.value, 10) || 0) / 100 : 0.45;
+    ghost.style.display = '';
+  } else {
+    ghost.style.display = 'none';
+  }
+
+  if (!wantGrid) { sten.style.display = 'none'; return; }
+  const g = a.grid || {rows: 3, cols: 3};
+  const active = layEditing && view === editView;
+  let html = '';
+  for (let i = 1; i < g.cols; i++) {
+    html += '<div class="gline v" style="left:' + (i * 100 / g.cols) + '%"></div>';
+  }
+  for (let j = 1; j < g.rows; j++) {
+    html += '<div class="gline h" style="top:' + (j * 100 / g.rows) + '%"></div>';
+  }
+  (a.objects || []).forEach(function (o, i) {
+    html += '<div class="mk' + (active && i === selIdx ? ' sel' : '')
+         + '" data-i="' + i + '" style="left:' + (o.x * 100)
+         + '%;top:' + (o.y * 100) + '%">'
+         + '<span class="mklabel">' + esc(o.label) + '</span></div>';
+  });
+  sten.innerHTML = html;
+  sten.style.display = '';
+}
+
+// Which grid cell a marker LANDED in. Purely informational — positions are
+// continuous and never snap; the grid is a visual reference, so an object may
+// sit anywhere inside a cell (or straddle a line).
+function cellOf(o, g) {
+  const c = Math.min(g.cols, Math.floor(o.x * g.cols) + 1);
+  const r = Math.min(g.rows, Math.floor(o.y * g.rows) + 1);
+  return 'R' + r + 'C' + c;
+}
+
+function renderObjList() {
+  const el = document.getElementById('objList');
+  if (!el) return;
+  const d = draftView();
+  if (!d || !d.objects.length) {
+    el.innerHTML = '<div style="color:#777;font-size:0.85rem;padding:6px 0">'
+      + esc(editView) + ' view 还没有标记 — 点击该相机画面添加，或按「＋ 添加物体」'
+      + '</div>';
+    return;
+  }
+  const g = d.grid || {rows: 3, cols: 3};
+  el.innerHTML = d.objects.map(function (o, i) {
+    return '<div class="objrow' + (i === selIdx ? ' sel' : '')
+      + '" onclick="objSelect(' + i + ')">'
+      + '<span class="idx">' + (i + 1) + '</span>'
+      + '<span style="flex:1">' + esc(o.label) + '</span>'
+      + '<span class="coord">' + cellOf(o, g) + ' · '
+      + o.x.toFixed(4) + ', ' + o.y.toFixed(4)
+      + '</span></div>';
+  }).join('');
+}
+
+function objSelect(i) { selIdx = i; drawStencil(); renderObjList(); }
+
+// Add -> position -> commit, one object at a time. Naming happens at COMMIT,
+// not at add: you know what the thing is once it's sitting where it belongs,
+// and a prompt up front interrupts the placing rhythm.
+function objAdd() {
+  const d = draftView();
+  if (!d) return;
+  d.objects.push({label: 'obj' + (d.objects.length + 1), x: 0.5, y: 0.5});
+  selIdx = d.objects.length - 1;
+  drawStencil(); renderObjList();
+  layMsg('已放到「' + editView + '」画面中心 — 鼠标拖动 或 方向键微调，'
+         + '到位后按「✓ 确定此物体」');
+}
+
+function objCommit() {
+  const d = draftView();
+  if (!d || selIdx < 0) { layMsg('没有正在放置的物体'); return; }
+  const cur = d.objects[selIdx];
+  const label = prompt('这个物体叫什么？', cur.label);
+  if (label === null) return;          // cancel keeps it selected, still movable
+  if (label.trim()) cur.label = label.trim();
+  const where = editView + ' ' + cur.x.toFixed(3) + ', ' + cur.y.toFixed(3);
+  // Deselect so the next click on empty canvas starts a NEW object rather
+  // than dragging the one just finished.
+  selIdx = -1;
+  drawStencil(); renderObjList();
+  layMsg('已确定 ' + cur.label + ' @ ' + where + ' — 「＋ 添加物体」放下一个，'
+         + '或「保存 + 抓参考快照」结束');
+}
+
+function objRename() {
+  const d = draftView();
+  if (!d || selIdx < 0) { layMsg('先选中一个标记'); return; }
+  const cur = d.objects[selIdx];
+  const label = prompt('新名称：', cur.label);
+  if (label === null) return;
+  if (label.trim()) { cur.label = label.trim(); drawStencil(); renderObjList(); }
+}
+
+function objDelete() {
+  const d = draftView();
+  if (!d || selIdx < 0) { layMsg('先选中一个标记'); return; }
+  d.objects.splice(selIdx, 1);
+  selIdx = Math.min(selIdx, d.objects.length - 1);
+  drawStencil(); renderObjList();
+}
+
+function onGridChange() {
+  const d = draftView();
+  if (!d) return;
+  // Grid is per-view: the two cameras frame the bench completely differently,
+  // so one may want 3x3 and the other 2x4.
+  d.grid = {rows: parseInt(document.getElementById('gridRows').value, 10) || 3,
+            cols: parseInt(document.getElementById('gridCols').value, 10) || 3};
+  drawStencil();
+}
+
+// Mouse: press a marker to grab it, drag to move; press empty canvas to jump
+// the marker being placed straight there (coarse), or to start a new one if
+// nothing is selected. Fine positioning is the arrow keys.
+let dragIdx = -1;
+
+function stencilPoint(view, e) {
+  const r = document.getElementById('stencil-' + view).getBoundingClientRect();
+  return {x: clamp01((e.clientX - r.left) / r.width),
+          y: clamp01((e.clientY - r.top) / r.height)};
+}
+
+function onStencilDown(e) {
+  if (!layEditing || !draft) return;
+  const view = e.currentTarget.id.replace('stencil-', '');
+  // Clicking the other camera switches the editor to it rather than doing
+  // nothing — the two views are edited in the same panel.
+  if (view !== editView) { setEditView(view); }
+  const d = draftView();
+  const mk = e.target.closest ? e.target.closest('.mk') : null;
+  if (mk) {
+    selIdx = parseInt(mk.dataset.i, 10);
+    dragIdx = selIdx;
+    e.preventDefault();
+    drawStencil(); renderObjList();
+    return;
+  }
+  const p = stencilPoint(view, e);
+  if (selIdx >= 0 && d.objects[selIdx]) {
+    d.objects[selIdx].x = p.x;
+    d.objects[selIdx].y = p.y;
+  } else {
+    d.objects.push({label: 'obj' + (d.objects.length + 1), x: p.x, y: p.y});
+    selIdx = d.objects.length - 1;
+    layMsg('已放置 — 拖动/方向键微调，到位后按「✓ 确定此物体」');
+  }
+  dragIdx = selIdx;
+  e.preventDefault();
+  drawStencil(); renderObjList();
+}
+
+function onStencilMove(e) {
+  const d = draftView();
+  if (dragIdx < 0 || !d || !d.objects[dragIdx]) return;
+  const p = stencilPoint(editView, e);
+  d.objects[dragIdx].x = p.x;
+  d.objects[dragIdx].y = p.y;
+  e.preventDefault();
+  drawStencil(); renderObjList();
+}
+
+function onStencilUp() { dragIdx = -1; }
+
+// Arrow-key nudge. Steps are in normalized image units: ~0.4% of the frame
+// per press, 10x with Shift for crossing the scene, 0.1% with Alt to settle
+// on an edge. Ignored while a text field has focus.
+document.addEventListener('keydown', function (e) {
+  if (!layEditing || !draft) return;
+  const t = e.target;
+  if (t && /^(INPUT|SELECT|TEXTAREA)$/.test(t.tagName)) return;
+  const dv = draftView();
+  if (!dv) return;
+  const step = e.shiftKey ? 0.04 : (e.altKey ? 0.001 : 0.004);
+  const o = selIdx >= 0 ? dv.objects[selIdx] : null;
+  let handled = true;
+  switch (e.key) {
+    case 'ArrowLeft':  if (o) o.x = clamp01(o.x - step); break;
+    case 'ArrowRight': if (o) o.x = clamp01(o.x + step); break;
+    case 'ArrowUp':    if (o) o.y = clamp01(o.y - step); break;
+    case 'ArrowDown':  if (o) o.y = clamp01(o.y + step); break;
+    case 'Tab':
+      if (dv.objects.length) {
+        selIdx = (selIdx + (e.shiftKey ? -1 : 1) + dv.objects.length)
+                 % dv.objects.length;
+      }
+      break;
+    case 'Delete': case 'Backspace': objDelete(); break;
+    case 'Escape': layoutCancelEdit(); return;
+    default: handled = false;
+  }
+  if (!handled) return;
+  e.preventDefault();
+  drawStencil(); renderObjList();
+});
+
+function enterEdit() {
+  layEditing = true;
+  document.getElementById('layoutEditor').style.display = '';
+  document.getElementById('layoutPick').style.display = 'none';
+  document.getElementById('layoutView').style.display = 'none';
+  renderObjList(); drawStencil();
+}
+
+function blankViews() {
+  return {exterior: {grid: {rows: 3, cols: 3}, objects: []},
+          wrist:    {grid: {rows: 3, cols: 3}, objects: []}};
+}
+
+function layoutNew() {
+  draft = {views: blankViews(), snapId: null, ghostVer: '', hasSnap: {}};
+  selIdx = -1;
+  document.getElementById('layoutName').value = '';
+  enterEdit();
+  setEditView('exterior');
+  layMsg('新建 layout：两个相机各标各的 — 外部标物体摆位，腕部标起始位姿。'
+         + '保存时建议两个 view 都抓快照');
+}
+
+async function layoutEditCurrent() {
+  if (!LAY.selected) { layMsg('先加载一个 layout 再编辑'); return; }
+  try {
+    const r = await fetch('/api/layout/' + encodeURIComponent(LAY.selected));
+    const j = await r.json();
+    if (!j.ok) { layMsg(j.msg || '加载失败'); return; }
+    const L = j.layout;
+    const v = {};
+    VIEWS.forEach(function (name) {
+      const src = L.views[name] || {grid: {rows: 3, cols: 3}, objects: []};
+      v[name] = {grid: {rows: src.grid.rows, cols: src.grid.cols},
+                 objects: (src.objects || []).map(function (o) {
+                   return {label: o.label, x: o.x, y: o.y};
+                 })};
+    });
+    draft = {views: v, snapId: L.id, ghostVer: L.hash,
+             hasSnap: L.has_snapshot || {}};
+    selIdx = -1;
+    document.getElementById('layoutName').value = L.id;
+    enterEdit();
+    setEditView('exterior');
+    layMsg('编辑 ' + L.id + ' — 改动保存后需重新「确认就位」');
+  } catch (e) { layMsg('加载失败: ' + e); }
+}
+
+function layoutCancelEdit() {
+  layEditing = false; draft = null; selIdx = -1;
+  document.getElementById('layoutEditor').style.display = 'none';
+  document.getElementById('layoutPick').style.display = '';
+  layMsg('已退出编辑');
+  refresh();
+}
+
+async function layoutSave(capture) {
+  if (!draft) return;
+  const name = document.getElementById('layoutName').value.trim();
+  if (!/^[A-Za-z0-9._-]{1,64}$/.test(name)) {
+    alert('Layout 名称只能含 字母/数字/._-（最长 64）'); return;
+  }
+  const total = VIEWS.reduce(function (n, v) {
+    return n + draft.views[v].objects.length;
+  }, 0);
+  if (!total && !confirm('两个 view 都没有物体标记，仍要保存？')) return;
+  onGridChange();
+  const j = await layApi('/api/layout', {
+    id: name, views: draft.views, capture: capture,
+  });
+  if (!j.ok) return;
+  layEditing = false; draft = null; selIdx = -1;
+  document.getElementById('layoutEditor').style.display = 'none';
+  document.getElementById('layoutPick').style.display = '';
+  await loadLayoutList();
+  document.getElementById('layoutSel').value = name;
+  await layApi('/api/layout/select', {id: name});
+  refresh();
+}
+
+async function layoutLoad() {
+  const id = document.getElementById('layoutSel').value;
+  if (!id) { layMsg('没有可加载的 layout'); return; }
+  await layApi('/api/layout/select', {id: id});
+  refresh();
+}
+
+async function layoutDelete() {
+  const id = document.getElementById('layoutSel').value;
+  if (!id) return;
+  if (!confirm('确认删除 layout「' + id + '」？(含参考快照，不可恢复)')) return;
+  await layApi('/api/layout/' + encodeURIComponent(id), null, 'DELETE');
+  await loadLayoutList();
+  refresh();
+}
+
+async function layoutConfirm() {
+  await layApi('/api/layout/confirm');
+  refresh();
+}
+
+async function layoutClear() {
+  await layApi('/api/layout/clear');
+  refresh();
+}
+
+function renderLayout(j) {
+  LAY = (j && j.layout) || {};
+  const st = document.getElementById('layoutState');
+  const badges = {exterior: document.getElementById('layoutBadge'),
+                  wrist: document.getElementById('layoutBadgeW')};
+  function setBadges(color, suffix) {
+    VIEWS.forEach(function (v) {
+      if (!badges[v]) return;
+      if (!LAY.selected) { badges[v].innerHTML = ''; return; }
+      const n = ((LAY.views || {})[v] || {}).objects || [];
+      badges[v].innerHTML = ' <span style="color:' + color + '">▣ '
+        + esc(LAY.selected) + ' · ' + n.length + ' obj' + suffix + '</span>';
+    });
+  }
+  if (LAY.confirmed) {
+    st.className = 'lstate ok';
+    st.textContent = '✓ ' + LAY.selected + ' 已确认 ' + (LAY.confirmed_at || '');
+    setBadges('#7fd67f', '');
+  } else if (LAY.selected) {
+    st.className = 'lstate sel';
+    st.textContent = LAY.selected + ' — 未确认';
+    setBadges('#e5cf8a', ' (未确认)');
+  } else {
+    st.className = 'lstate none';
+    st.textContent = '未选择';
+    setBadges('', '');
+  }
+  if (!layEditing) {
+    document.getElementById('layoutView').style.display =
+      LAY.selected ? '' : 'none';
+    document.getElementById('layoutPick').style.display = '';
+  }
+  const btn = document.getElementById('btnStart');
+  if (btn) {
+    btn.disabled = !LAY.confirmed;
+    btn.title = LAY.confirmed ? ''
+      : '需要先完成 Layout 准备并「确认就位」';
+  }
+  if (!layEditing) drawStencil();
+}
+
 async function refresh() {
   try {
     const r = await fetch('/api/status');
@@ -1903,7 +2890,9 @@ async function refresh() {
     // actor stdout the phase parser keys on). Surface it as its own state so
     // "arm reset, waiting for s" doesn't masquerade as a stuck "starting".
     if (c.running && c.waiting_for_start) {
-      stateLabel = '等待开始 / waiting for start'; dotCls = 'ok';
+      stateLabel = '等待放行 / waiting for release'; dotCls = 'ok';
+    } else if (c.running && c.robot_released) {
+      stateLabel = '已放行 · 未记录 / live, NOT recording'; dotCls = 'idle';
     } else if (c.running) {
       stateLabel = c.phase === 'error' ? '运行中 (有错误)' : '采集中';
       dotCls = c.phase === 'error' ? 'bad' : 'ok';
@@ -1917,7 +2906,7 @@ async function refresh() {
     let html = '<table>';
     // Suppress the raw "(phase=starting)" suffix while waiting at the start
     // gate — it's the buffered-log phase and reads as "stuck" there.
-    const phaseSuffix = (c.running && c.waiting_for_start)
+    const phaseSuffix = (c.running && (c.waiting_for_start || c.robot_released))
       ? '' : ' (phase=' + esc(c.phase || '-') + ')';
     html += '<tr><td><span class="dot ' + dotCls + '"></span>状态</td><td>'
          + esc(stateLabel) + phaseSuffix + '</td></tr>';
@@ -1926,10 +2915,21 @@ async function refresh() {
     if (c.waiting_for_start) {
       const done = c.episodes_done || 0;
       html += '<tr><td>就绪</td><td>'
-        + '<b style="color:#1565c0">⏸ 机械臂已复位 — 摆好物体后按「开始下一条」'
-        + '(或键盘 s 键)</b><br>'
+        + '<b style="color:#1565c0">⏸ 机械臂已复位并锁住 — 按 layout 摆好物体后'
+        + '按「① 放行机械臂」(或键盘 s 键)</b><br>'
         + '<span style="font-size:12px;color:#777">已完成 ' + done
         + (c.target ? ' / ' + c.target : '') + ' 条</span></td></tr>';
+    }
+    // Released but not recording: the most dangerous state to misread — the
+    // arm follows GELLO and looks exactly like collection, but nothing is
+    // being saved. Say so loudly.
+    if (c.robot_released) {
+      html += '<tr><td>已放行</td><td>'
+        + '<b style="color:#e09b3d">▶ 机械臂已放行，GELLO 可以操作 — '
+        + '但<u>还没有在记录</u></b><br>'
+        + '<span style="font-size:12px;color:#999">把机械臂摆到本条 episode 的'
+        + '起始位姿，再按「② 开始记录」(或键盘 r 键)。这段摆位过程不会进数据集。'
+        + '</span></td></tr>';
     }
     // Startup progress: only while a run is spinning up and not yet
     // controllable (env/Ray/camera/reset). Tells the operator when SpaceMouse
@@ -1977,11 +2977,22 @@ async function refresh() {
     html += '</table>';
     document.getElementById('status').innerHTML = html;
     setCams(j.cam_running, !!c.running);
+    renderCamCtl(!!j.cam_running, !!c.running);
     renderRobot(j, !!c.running);
+    renderLayout(j);
   } catch (e) {
     document.getElementById('status').innerHTML = 'status error: ' + esc(e);
   }
 }
+// mousemove/up on the DOCUMENT so a drag that leaves the image still tracks
+// and still releases — otherwise the marker sticks to the cursor.
+VIEWS.forEach(function (v) {
+  document.getElementById('stencil-' + v)
+          .addEventListener('mousedown', onStencilDown);
+});
+document.addEventListener('mousemove', onStencilMove);
+document.addEventListener('mouseup', onStencilUp);
+loadLayoutList();
 refresh(); setInterval(refresh, 1500);
 
 // -- dataset manager ---------------------------------------------------
@@ -2093,6 +3104,32 @@ async function refreshDatasets() {
   }
 }
 
+// Playback speed. The server paces the MJPEG stream, so changing speed means
+// re-requesting it — which restarts the episode from frame 0.
+let playSpeed = 1;
+let playNow = null;   // {dsid, name, ep} — what is on screen, for re-requests
+
+function setPlaySpeed(s) {
+  playSpeed = s;
+  const box = document.getElementById('playSpeeds');
+  if (box) {
+    box.querySelectorAll('button').forEach(function (b) {
+      b.className = 'small' + (parseFloat(b.dataset.s) === s ? ' primary' : '');
+    });
+  }
+  if (playNow) openPlayback(playNow.dsid, playNow.name, playNow.ep);
+}
+
+function openPlayback(dsid, name, ep) {
+  playNow = {dsid: dsid, name: name, ep: ep};
+  document.getElementById('playTitle').textContent =
+    name + ' / episode ' + ep + '  —  ' + playSpeed + '× (播完即止)';
+  document.getElementById('playImg').src =
+    '/api/dataset/' + dsid + '/episode/' + ep + '/play.mjpg'
+    + '?speed=' + playSpeed + '&ts=' + Date.now();
+  document.getElementById('playOverlay').style.display = 'flex';
+}
+
 function playEpisode(i) {
   const d = dsCache[i];
   if (!d || d.error) return;
@@ -2101,16 +3138,13 @@ function playEpisode(i) {
   if (n === null) return;
   const ep = parseInt(n, 10);
   if (isNaN(ep) || ep < 0 || ep > max) { alert('无效 episode index'); return; }
-  document.getElementById('playTitle').textContent =
-    d.name + ' / episode ' + ep + ' (播完即止)';
-  document.getElementById('playImg').src =
-    '/api/dataset/' + d.dsid + '/episode/' + ep + '/play.mjpg?ts=' + Date.now();
-  document.getElementById('playOverlay').style.display = 'flex';
+  openPlayback(d.dsid, d.name, ep);
 }
 
 function closePlayback() {
   document.getElementById('playImg').removeAttribute('src');
   document.getElementById('playOverlay').style.display = 'none';
+  playNow = null;
 }
 
 async function deleteDataset(i) {
@@ -2172,11 +3206,7 @@ function renderEpisodes(i, eps) {
 function playEpisodeIdx(i, ep) {
   const d = dsCache[i];
   if (!d) return;
-  document.getElementById('playTitle').textContent =
-    d.name + ' / episode ' + ep + ' (播完即止)';
-  document.getElementById('playImg').src =
-    '/api/dataset/' + d.dsid + '/episode/' + ep + '/play.mjpg?ts=' + Date.now();
-  document.getElementById('playOverlay').style.display = 'flex';
+  openPlayback(d.dsid, d.name, ep);
 }
 
 async function deleteEpisode(i, ep) {
@@ -2207,11 +3237,14 @@ CAM_BUSY_MSG = "collection running - cameras owned by env"
 def build_app(cams: CamManager, mgr: CollectionManager,
               vkbd: Optional[VirtualKeyboard] = None,
               dataset_roots: Optional[list[str]] = None,
-              live_cams: Optional["LiveCamSource"] = None) -> "Flask":
+              live_cams: Optional["LiveCamSource"] = None,
+              layout_gate: Optional["LayoutGate"] = None) -> "Flask":
     if not HAS_FLASK:
         raise RuntimeError("flask not installed on this host")
     if dataset_roots is None:
         dataset_roots = list(DATASET_ROOTS)
+    if layout_gate is None:
+        layout_gate = LayoutGate(LayoutStore(LAYOUT_DIR_HOST))
     app = Flask(__name__)
 
     # Robot-state cache for the 1.5s status poll: at most one zerorpc
@@ -2316,19 +3349,173 @@ def build_app(cams: CamManager, mgr: CollectionManager,
             return Response("no frame", status=404)
         return Response(buf, mimetype="image/jpeg")
 
+    # -- idle camera preview (opt-in) -------------------------------------
+    # The dashboard is launched --no-cam-on-start on purpose: leaving the ZEDs
+    # free lets the next collection's in-container env open them COLD, the only
+    # handoff proven reliable at HD720 (see _reclaim_cameras). But the layout
+    # stage needs to SEE the bench, so the preview is available on demand —
+    # off by default, explicitly turned on, and released again by
+    # CollectionManager.start(), which then probes from inside the container
+    # until the cameras are proven openable before launching the env.
+    @app.post("/api/cams/start")
+    def api_cams_start():
+        if mgr.is_collecting():
+            return jsonify({"ok": False,
+                            "msg": "采集进行中 — 相机由 env 持有"}), 409
+        if not HAS_PYZED:
+            return jsonify({"ok": False, "msg": "pyzed 不可用"}), 503
+        try:
+            msg = cams.start()
+        except Exception as e:
+            return jsonify({"ok": False,
+                            "msg": f"相机打开失败: {e!r}"[:300]}), 500
+        return jsonify({"ok": cams.is_running(), "msg": f"相机预览: {msg}",
+                        "missing_cams": cams.missing_cams})
+
+    @app.post("/api/cams/stop")
+    def api_cams_stop():
+        if mgr.is_collecting():
+            return jsonify({"ok": False,
+                            "msg": "采集进行中 — 相机由 env 持有"}), 409
+        try:
+            cams.stop()
+        except Exception as e:
+            return jsonify({"ok": False,
+                            "msg": f"相机关闭失败: {e!r}"[:300]}), 500
+        return jsonify({"ok": True, "msg": "相机预览已关闭 — ZED 已释放"})
+
     @app.get("/api/status")
     def api_status():
         coll = mgr.status()
         # Piggyback robot state ONLY when idle (never poke zerorpc while the
         # env owns the robot), throttled via the 3s cache above.
         robot = None if coll["running"] else _robot_state_for_status()
+        # The dataset dir only appears once the env has created it, so the
+        # parked layout provenance lands on one of these polls.
+        layout_gate.flush_pending()
         return jsonify({
             "collection": coll,
             "cam_running": cams.is_running(),
             "missing_cams": cams.missing_cams,
             "has_pyzed": HAS_PYZED,
             "robot": robot,
+            "layout": layout_gate.status(),
         })
+
+    # -- layout-prepare stage -------------------------------------------
+    # A layout is an image-space stencil (grid + markers + reference
+    # snapshot) the operator matches the physical scene against before
+    # recording. Collection is gated on one being selected AND confirmed.
+    def _layout_err(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            try:
+                return fn(*args, **kwargs)
+            except LayoutError as e:
+                return jsonify({"ok": False, "msg": str(e)}), 400
+        return wrapper
+
+    @app.get("/api/layouts")
+    @_layout_err
+    def api_layouts():
+        return jsonify({"ok": True, "layouts": layout_gate.store.list(),
+                        "dir": layout_gate.store.root})
+
+    @app.get("/api/layout/<layout_id>")
+    @_layout_err
+    def api_layout_get(layout_id):
+        return jsonify({"ok": True, "layout": layout_gate.store.load(layout_id)})
+
+    @app.get("/api/layout/<layout_id>/snapshot/<view>.jpg")
+    @_layout_err
+    def api_layout_snapshot(layout_id, view):
+        buf = layout_gate.store.snapshot_bytes(layout_id, view)
+        if buf is None:
+            return Response("no snapshot", status=404)
+        # Snapshots are overwritten in place on re-save; never let a browser
+        # serve a stale ghost against a freshly re-photographed scene.
+        return Response(buf, mimetype="image/jpeg",
+                        headers={"Cache-Control": "no-store"})
+
+    @app.post("/api/layout")
+    @_layout_err
+    def api_layout_save():
+        body = request.get_json(silent=True) or {}
+        layout_id = str(body.get("id", "")).strip()
+        # `capture` lists which views to re-photograph now; views left out keep
+        # whatever snapshot they already had, so re-nudging markers in one view
+        # never drops the other view's ghost.
+        capture = body.get("capture") or []
+        if not isinstance(capture, list):
+            return jsonify({"ok": False, "msg": "capture must be a list"}), 400
+        snapshots = {}
+        if capture:
+            src = _cam_src()
+            if src is cams and not cams.is_running():
+                return jsonify({"ok": False,
+                                "msg": f"{CAM_BUSY_MSG} — 无法抓取参考快照"}), 409
+            for view in capture:
+                if view not in LAYOUT_VIEWS:
+                    return jsonify({"ok": False,
+                                    "msg": f"unknown view '{view}'"}), 400
+                buf = src.get_jpeg(view)
+                if buf is None:
+                    return jsonify({"ok": False,
+                                    "msg": f"{view} 相机没有可用帧，快照抓取失败"}), 409
+                # The live source hands back an 8x8 placeholder when a feed is
+                # stale, and that would be stored as a grey "reference" the
+                # operator is then asked to align the real bench against.
+                if not is_usable_snapshot(buf):
+                    return jsonify({
+                        "ok": False,
+                        "msg": f"{view} 当前是占位帧（相机未就绪或采集未推流）"
+                               " — 无法抓取参考快照"}), 409
+                snapshots[view] = buf
+        layout = layout_gate.store.save(
+            layout_id, body.get("views"),
+            note=str(body.get("note", "")), snapshots=snapshots)
+        # Keep the armed copy in sync; an edit drops any stale confirmation.
+        layout_gate.refresh()
+        shot = ("（已抓 " + "/".join(snapshots) + " 快照）") if snapshots else ""
+        return jsonify({"ok": True, "layout": layout,
+                        "msg": f"已保存 layout '{layout['id']}'" + shot})
+
+    @app.route("/api/layout/<layout_id>", methods=["DELETE"])
+    @_layout_err
+    def api_layout_delete(layout_id):
+        cur = layout_gate.current()
+        msg = layout_gate.store.delete(layout_id)
+        if cur and cur["id"] == layout_id:
+            layout_gate.clear()
+        return jsonify({"ok": True, "msg": msg})
+
+    @app.post("/api/layout/select")
+    @_layout_err
+    def api_layout_select():
+        body = request.get_json(silent=True) or {}
+        layout = layout_gate.select(str(body.get("id", "")).strip())
+        return jsonify({"ok": True, "layout": layout,
+                        "msg": f"已加载 layout '{layout['id']}' — "
+                               "摆好物体后点「确认就位」"})
+
+    @app.post("/api/layout/confirm")
+    @_layout_err
+    def api_layout_confirm():
+        # Confirming mid-run would silently re-arm the gate for a scene the
+        # operator has not actually re-checked; the between-episode reposition
+        # is driven by the start gate (开始下一条), not by this.
+        if mgr.is_collecting():
+            return jsonify({"ok": False,
+                            "msg": "采集进行中 — 无法重新确认 layout"}), 409
+        layout_id = layout_gate.confirm()
+        return jsonify({"ok": True,
+                        "msg": f"layout '{layout_id}' 已确认就位 — Start 已解锁"})
+
+    @app.post("/api/layout/clear")
+    @_layout_err
+    def api_layout_clear():
+        layout_gate.clear()
+        return jsonify({"ok": True, "msg": "已取消 layout 选择"})
 
     @app.post("/api/collect/start")
     def api_collect_start():
@@ -2347,13 +3534,106 @@ def build_app(cams: CamManager, mgr: CollectionManager,
             return jsonify({"ok": False,
                             "msg": "invalid dataset name (allowed: letters, "
                                    "digits, . _ -)"}), 400
+        # layout-prepare gate: no recording without a confirmed arrangement,
+        # so every episode on disk is traceable to a known scene layout.
+        gate_ok, gate_msg = layout_gate.check()
+        if not gate_ok:
+            return jsonify({"ok": False, "msg": gate_msg}), 409
         msg = mgr.start(num_episodes, task, dataset_name)
         code = 409 if msg.startswith("refused") else 200
+        if code == 200 and dataset_name:
+            layout_gate.arm_dataset_write(
+                os.path.join(dataset_roots[0], dataset_name),
+                task, num_episodes)
         return jsonify({"ok": code == 200, "msg": msg}), code
 
     @app.post("/api/collect/stop")
     def api_collect_stop():
         return jsonify({"ok": True, "msg": mgr.stop()})
+
+    # -- session teardown -------------------------------------------------
+    # Two levels, mirroring what the launchers do:
+    #   reap  = teleop-stop.sh stage 2 — free the ZEDs + GELLO, keep FCI.
+    #   stop  = the whole script       — + NUC controller down, FCI released.
+    # Both SHELL OUT so the portal and the CLI can never disagree about what
+    # "stopped" means.
+    def _run_launcher(argv: list[str], timeout: float) -> tuple[bool, str, int]:
+        r = subprocess.run(argv, capture_output=True, timeout=timeout)
+        out = (r.stdout + b"\n" + r.stderr).decode("utf-8", "replace").strip()
+        return r.returncode == 0, out, r.returncode
+
+    def _require_root() -> Optional[tuple]:
+        if os.geteuid() != 0:
+            return jsonify({
+                "ok": False,
+                "msg": ("dashboard is not running as root — teardown needs it "
+                        "(relaunch via teleop.sh, or run "
+                        "`sudo tasl/launch/teleop-stop.sh` yourself)"),
+            }), 503
+        return None
+
+    @app.post("/api/session/reap")
+    def api_session_reap():
+        """Free the ZEDs + GELLO by reaping the in-container run. Leaves the
+        NUC controller and FCI alone, so the next episode can start without
+        re-activating FCI in Desk — this is the fix for an orphaned run."""
+        denied = _require_root()
+        if denied:
+            return denied
+        if not os.path.isfile(LAUNCH_LIB_SH):
+            return jsonify({"ok": False,
+                            "msg": f"lib.sh not found at {LAUNCH_LIB_SH}"}), 500
+        try:
+            # Call the shell function itself — one definition of the kill set.
+            ok_rc, out, rc = _run_launcher(
+                ["bash", "-c",
+                 f'source {shlex.quote(LAUNCH_LIB_SH)} && reap_collection_procs'],
+                timeout=90.0)
+        except subprocess.TimeoutExpired:
+            return jsonify({"ok": False, "msg": "reap timed out after 90s"}), 504
+        mgr.after_external_teardown()
+        return jsonify({"ok": ok_rc, "returncode": rc, "output": out[-6000:],
+                        "msg": ("已清理容器内采集进程，相机 + GELLO 已释放"
+                                "（FCI 保持不变）" if ok_rc
+                                else f"reap 返回 {rc} — 见输出")})
+
+    @app.post("/api/session/stop")
+    def api_session_stop():
+        """Full staged teardown = teleop-stop.sh --keep-dashboard.
+
+        --keep-dashboard because stage 1 SIGTERMs collect.py, which is the
+        process serving this very request — without it the operator loses the
+        UI halfway through their own teardown.
+        """
+        denied = _require_root()
+        if denied:
+            return denied
+        if not os.path.isfile(TELEOP_STOP_SH):
+            return jsonify({"ok": False,
+                            "msg": f"not found: {TELEOP_STOP_SH}"}), 500
+        try:
+            ok_rc, out, rc = _run_launcher(
+                ["bash", TELEOP_STOP_SH, "--keep-dashboard"], timeout=180.0)
+        except subprocess.TimeoutExpired:
+            return jsonify({
+                "ok": False,
+                "msg": ("teleop-stop.sh timed out after 180s — the NUC ssh step "
+                        "may be blocked; run it in a terminal to see"),
+            }), 504
+        mgr.after_external_teardown()
+        # The script WARNs (does not fail) when :4242 stays open, so grep the
+        # transcript: a teardown that silently left FCI held is the one outcome
+        # the operator must not mistake for success.
+        fci_held = "STILL OPEN" in out
+        msg = "会话已结束 — FCI 已释放，相机/GELLO 已free，dashboard 保持运行"
+        if fci_held:
+            msg = ("⚠ 容器内进程已清理，但 NUC 控制器 :4242 仍然开着 — "
+                   "FCI 没有释放。见输出，可能需要手动到 NUC 上 compose down")
+        elif not ok_rc:
+            msg = f"teleop-stop.sh 返回 {rc} — 见输出"
+        return jsonify({"ok": ok_rc and not fci_held, "returncode": rc,
+                        "fci_released": not fci_held,
+                        "output": out[-8000:], "msg": msg})
 
     # -- mark-success (uinput) ------------------------------------------
     @app.post("/api/mark_success")
@@ -2432,6 +3712,61 @@ def build_app(cams: CamManager, mgr: CollectionManager,
             "a startup snapshot) — docker restart rlinf-eval, or press physical 's'"
         )
         return jsonify({"ok": True, "msg": "KEY_S injected",
+                        "visible_in_container": visible, "caveat": caveat})
+
+    @app.post("/api/start_recording")
+    def api_start_recording():
+        # Inject 'r' — second step of the two-stage gate. The robot is already
+        # released and following the leader; this is the point where frames
+        # start being kept, so everything before it (getting into position) is
+        # discarded rather than taught to the policy.
+        ok, msg = check_gate(mgr.is_collecting(), require_collecting=True)
+        if not ok:
+            return jsonify({"ok": False,
+                            "msg": f"{msg} - 开始记录 only valid mid-run"}), 409
+        if vkbd is None:
+            return jsonify({
+                "ok": False,
+                "msg": ("uinput virtual keyboard unavailable "
+                        "(evdev missing or dashboard not launched with sudo)"),
+            }), 503
+        try:
+            vkbd.inject_record()
+        except Exception as e:
+            return jsonify({"ok": False, "msg": f"inject failed: {e!r}"[:300]}), 500
+        visible = vkbd_visible_in_container(vkbd.path)
+        caveat = None if visible else (
+            "virtual keyboard not visible inside rlinf-eval (container /dev is "
+            "a startup snapshot) — docker restart rlinf-eval, or press physical 'r'"
+        )
+        return jsonify({"ok": True, "msg": "KEY_R injected — 开始记录",
+                        "visible_in_container": visible, "caveat": caveat})
+
+    @app.post("/api/discard_episode")
+    def api_discard_episode():
+        # Inject 'a' — end this episode with reward -1 so only_success drops
+        # it. This is the safe way to get rid of a bad take mid-run: nothing is
+        # written, so nothing has to be deleted out from under LeRobot.
+        ok, msg = check_gate(mgr.is_collecting(), require_collecting=True)
+        if not ok:
+            return jsonify({"ok": False,
+                            "msg": f"{msg} - 丢弃只在采集中有效"}), 409
+        if vkbd is None:
+            return jsonify({
+                "ok": False,
+                "msg": ("uinput virtual keyboard unavailable "
+                        "(evdev missing or dashboard not launched with sudo)"),
+            }), 503
+        try:
+            vkbd.inject_discard()
+        except Exception as e:
+            return jsonify({"ok": False, "msg": f"inject failed: {e!r}"[:300]}), 500
+        visible = vkbd_visible_in_container(vkbd.path)
+        caveat = None if visible else (
+            "virtual keyboard not visible inside rlinf-eval (container /dev is "
+            "a startup snapshot) — docker restart rlinf-eval, or press physical 'a'"
+        )
+        return jsonify({"ok": True, "msg": "KEY_A injected — 本条已丢弃，不会保存",
                         "visible_in_container": visible, "caveat": caveat})
 
     # -- robot panel (idle-only) ----------------------------------------
@@ -2549,8 +3884,17 @@ def build_app(cams: CamManager, mgr: CollectionManager,
         if not image_keys:
             return jsonify({"ok": False,
                             "msg": "dataset has no image features"}), 404
+        # Playback speed. The server paces the MJPEG stream, so speed is a
+        # divisor on the inter-frame sleep; at high multiples the sleep hits 0
+        # and the real ceiling becomes decode+encode throughput, which is why
+        # the effective rate is reported back in a header rather than promised.
+        try:
+            speed = float(request.args.get("speed", 1.0))
+        except (TypeError, ValueError):
+            speed = 1.0
+        speed = min(max(speed, 0.1), 16.0)
         fps = float(info.get("fps") or PLAYBACK_MAX_FPS)
-        period = 1.0 / min(max(fps, 0.1), PLAYBACK_MAX_FPS)
+        period = 1.0 / min(max(fps, 0.1), PLAYBACK_MAX_FPS) / speed
 
         def gen():
             import cv2
@@ -2586,7 +3930,8 @@ def build_app(cams: CamManager, mgr: CollectionManager,
                 pf.close()
 
         return Response(gen(),
-                        mimetype="multipart/x-mixed-replace; boundary=frame")
+                        mimetype="multipart/x-mixed-replace; boundary=frame",
+                        headers={"X-Playback-Speed": f"{speed:g}"})
 
     @app.get("/api/dataset/<dsid>/episodes")
     def api_dataset_episodes(dsid):
@@ -2595,17 +3940,48 @@ def build_app(cams: CamManager, mgr: CollectionManager,
             return jsonify({"ok": False, "msg": "dataset not found"}), 404
         return jsonify({"ok": True, "episodes": list_episodes_meta(ds_dir)})
 
+    def _active_dataset_dir() -> Optional[str]:
+        """Directory the running collection writes to, or None when idle.
+
+        Returns the ROOT itself when the target is unknown, so an unrecognised
+        state refuses every delete rather than guessing.
+        """
+        if not mgr.is_collecting():
+            return None
+        name = (mgr.last_launch or {}).get("dataset_name")
+        if not name:
+            return dataset_roots[0]
+        return os.path.abspath(os.path.join(dataset_roots[0], name))
+
+    def _refuse_if_active(ds_dir: str):
+        """Deleting renumbers every later episode and rebuilds the meta files.
+        Doing that to the dataset LeRobot currently has open — it holds
+        total_episodes and the episode list in memory — corrupts it. Datasets
+        the run is not touching are perfectly safe to edit mid-collection.
+        """
+        active = _active_dataset_dir()
+        if active is None:
+            return None
+        if os.path.abspath(ds_dir) == active or active == dataset_roots[0]:
+            return jsonify({
+                "ok": False,
+                "msg": ("refused: 这是当前采集正在写入的数据集 — 删除会重排 "
+                        "episode 编号并重建元数据，和 LeRobot 的内存状态冲突。"
+                        "坏的一条请用「✗ 丢弃本条」当场丢掉；已保存的等本轮结束再删。"),
+            }), 409
+        return None
+
     @app.route("/api/dataset/<dsid>/episode/<int:n>", methods=["DELETE"])
     def api_dataset_episode_delete(dsid, n):
         if request.args.get("confirm") != "yes":
             return jsonify({"ok": False,
                             "msg": "refused: requires ?confirm=yes"}), 400
-        if mgr.is_collecting():
-            return jsonify({"ok": False,
-                            "msg": "refused: collection running"}), 409
         ds_dir = _resolve_dataset(dsid, dataset_roots)
         if ds_dir is None:
             return jsonify({"ok": False, "msg": "dataset not found"}), 404
+        denied = _refuse_if_active(ds_dir)
+        if denied:
+            return denied
         msg = delete_episode(ds_dir, int(n))
         if msg.startswith("deleted"):
             _log.info(f"episode delete: {ds_dir} ep={n} -> {msg}")
@@ -2618,13 +3994,12 @@ def build_app(cams: CamManager, mgr: CollectionManager,
         if request.args.get("confirm") != "yes":
             return jsonify({"ok": False,
                             "msg": "refused: requires ?confirm=yes"}), 400
-        if mgr.is_collecting():
-            return jsonify({"ok": False,
-                            "msg": "refused: collection running "
-                                   "(datasets being written)"}), 409
         ds_dir = _resolve_dataset(dsid, dataset_roots)
         if ds_dir is None:
             return jsonify({"ok": False, "msg": "dataset not found"}), 404
+        denied = _refuse_if_active(ds_dir)
+        if denied:
+            return denied
         # Belt-and-suspenders: _resolve_dataset already enforced this.
         if not any(is_inside_root(ds_dir, r) for r in dataset_roots):
             return jsonify({"ok": False,
@@ -2706,6 +4081,8 @@ def main():
                    help="Don't acquire cameras at startup.")
     p.add_argument("--dataset-roots", default=",".join(DATASET_ROOTS),
                    help="Comma-separated roots scanned by the dataset panel.")
+    p.add_argument("--layout-dir", default=LAYOUT_DIR_HOST,
+                   help="Directory holding layout stencils (<id>.json/.jpg).")
     args = p.parse_args()
 
     logging.basicConfig(level=logging.INFO,
@@ -2742,8 +4119,15 @@ def main():
     dataset_roots = [r.strip() for r in args.dataset_roots.split(",")
                      if r.strip()]
     mgr = CollectionManager(cams, vkbd)
+    try:
+        os.makedirs(args.layout_dir, exist_ok=True)
+    except OSError as e:
+        _log.warning(f"layout dir {args.layout_dir} not creatable: {e}")
+    layout_gate = LayoutGate(LayoutStore(args.layout_dir))
+    _log.info(f"layout dir: {args.layout_dir} "
+              f"({len(layout_gate.store.list())} layouts)")
     app = build_app(cams, mgr, vkbd, dataset_roots=dataset_roots,
-                    live_cams=live_cams)
+                    live_cams=live_cams, layout_gate=layout_gate)
     _log.info(f"serving on {args.bind}:{args.port}")
     app.run(host=args.bind, port=args.port, threaded=True, debug=False)
 
