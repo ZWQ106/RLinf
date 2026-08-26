@@ -24,3 +24,11 @@ PKG-INFO
 
 # Collected LeRobot datasets + SVO archives (data, never commit)
 datasets/
+
+# Demo exports from the dashboards' save-video / save-layout buttons
+saved_demo/
+
+# Rollout videos + meta written by the openpi portal (pulled by TASL2 via
+# tasl/launch/pull_demos_from_tasl1.sh — never commit)
+tasl/eval_episodes/
+tasl/logs/
