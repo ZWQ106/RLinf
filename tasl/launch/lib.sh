@@ -61,7 +61,9 @@ ensure_root() {
   local self="$1"; shift
   if [[ "$(id -u)" -ne 0 ]]; then
     step "Re-running under sudo (cameras + uinput need root) — enter the Desktop password"
-    exec sudo bash "$self" "$@"
+    # sudo strips the environment; ALLOW_MISSING_WRIST must survive the re-exec
+    # or the degraded single-camera mode silently reverts to the strict check.
+    exec sudo ALLOW_MISSING_WRIST="${ALLOW_MISSING_WRIST:-}" bash "$self" "$@"
   fi
 }
 
@@ -166,12 +168,18 @@ PY
 }
 
 # zeds_free: are both expected ZED serials present + enumerable (not held)?
+# ALLOW_MISSING_WRIST=1 relaxes this to exterior-only (degraded mode for a dead
+# wrist ZED-M — pair with the openpi dashboard's --allow-missing-wrist flag).
 zeds_free() {
   if [[ -n "$LAUNCH_DRY_RUN" ]]; then echo "DRY zed probe: $ZED_EXTERIOR $ZED_WRIST"; [[ "${DRY_ZEDS_FREE:-1}" == 1 ]]; return; fi
   local serials
   serials=$(docker exec rlinf-eval /opt/venv/openpi/bin/python -c \
     "import pyzed.sl as sl; print([d.serial_number for d in sl.Camera.get_device_list()])" 2>/dev/null | tail -1)
-  [[ "$serials" == *"$ZED_EXTERIOR"* && "$serials" == *"$ZED_WRIST"* ]]
+  if [[ "${ALLOW_MISSING_WRIST:-}" == 1 ]]; then
+    [[ "$serials" == *"$ZED_EXTERIOR"* ]]
+  else
+    [[ "$serials" == *"$ZED_EXTERIOR"* && "$serials" == *"$ZED_WRIST"* ]]
+  fi
 }
 
 # STEREOLABS USB ids for the two CAMERA interfaces (not the f6xx HID controls):
@@ -306,7 +314,12 @@ preflight_robot() {
   step "Mutual exclusion: stop the other dashboard"
   kill_other_dashboard "$me"
   ok "other dashboard stopped"
-  step "Cameras: both ZEDs free ($ZED_EXTERIOR exterior, $ZED_WRIST wrist)"
+  if [[ "${ALLOW_MISSING_WRIST:-}" == 1 ]]; then
+    warn "ALLOW_MISSING_WRIST=1 — DEGRADED mode: wrist ZED not required, policy runs half-blind"
+    step "Cameras: exterior ZED free ($ZED_EXTERIOR; wrist $ZED_WRIST waived)"
+  else
+    step "Cameras: both ZEDs free ($ZED_EXTERIOR exterior, $ZED_WRIST wrist)"
+  fi
   ensure_zeds_free || die "ZED cameras still not visible to the SDK after reaping
     in-container holders AND a USB reset. Escalate:
       1. $TASL/launch/zed-check.sh          # confirm which serial is missing

@@ -35,6 +35,11 @@ desk "pkill -TERM -f '[/_]openpi[.]py' || true"
 if [[ -z "$LAUNCH_DRY_RUN" ]]; then sleep 2; fi
 
 step "Launch openpi dashboard :8003 (--policy-host 127.0.0.1 --policy-port 8000)"
-desk "cd $TASL && ulimit -n 8192 && PYTHONPATH=$TASL:$SITE_PKGS:$DESKTOP_HOME/work/openpi/packages/openpi-client/src setsid /usr/bin/python3 dashboards/openpi.py --port 8003 --policy-host 127.0.0.1 --policy-port 8000 </dev/null >> $TASL/logs/openpi.log 2>&1 &"
+WRIST_FLAG=""
+if [[ "${ALLOW_MISSING_WRIST:-}" == 1 ]]; then
+  WRIST_FLAG="--allow-missing-wrist"
+  warn "dashboard starts with $WRIST_FLAG — wrist view is a BLACK frame"
+fi
+desk "cd $TASL && ulimit -n 8192 && PYTHONPATH=$TASL:$SITE_PKGS:$DESKTOP_HOME/work/openpi/packages/openpi-client/src setsid /usr/bin/python3 dashboards/openpi.py --port 8003 --policy-host 127.0.0.1 --policy-port 8000 $WRIST_FLAG </dev/null >> $TASL/logs/openpi.log 2>&1 &"
 wait_http 8003 || die "openpi dashboard did not answer on :8003 (see $TASL/logs/openpi.log)"
 ok "READY — openpi dashboard at http://$TS_IP:8003 (Tailscale; robot-net IP if TS offline)"
