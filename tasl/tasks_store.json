@@ -1,0 +1,189 @@
+[
+  {
+    "id": "T1-a",
+    "prompt": "pick up the blue cup and place it into the red cup",
+    "layout": "T1-a-L1",
+    "layouts": [
+      "T1-a-L1",
+      "T1-a-L2",
+      "T1-a-L3",
+      "T1-a-L4",
+      "T1-a-L5",
+      "T1-a-L6",
+      "Layout_task_1"
+    ],
+    "datasets": [
+      "T1-a"
+    ],
+    "created": "2026-08-13 16:49",
+    "updated": "2026-08-25 15:34"
+  },
+  {
+    "id": "T1-b",
+    "prompt": "stack the red block on top of the blue block",
+    "layout": "T1-b-L1",
+    "layouts": [
+      "T1-b-L1",
+      "T1-b-L2",
+      "T1-b-L3",
+      "T1-b-L4",
+      "T1-b-L5",
+      "T1-b-L6",
+      "T1-b-1"
+    ],
+    "datasets": [
+      "T1-b"
+    ],
+    "created": "2026-08-20 16:39",
+    "updated": "2026-08-25 15:35"
+  },
+  {
+    "id": "T2-a",
+    "prompt": "press the blue button",
+    "layout": "T2-L1",
+    "layouts": [
+      "T2-L1",
+      "T2-a-L1",
+      "T2-a-L2",
+      "T2-a-L3",
+      "T2-a-L4",
+      "T2-a-L5",
+      "T2-a-L6"
+    ],
+    "datasets": [
+      "T2-a-10ep",
+      "T2-a-15ep"
+    ],
+    "created": "2026-08-16 16:00",
+    "updated": "2026-08-25 15:39"
+  },
+  {
+    "id": "T2-b",
+    "prompt": "close the lid of the wooden shape sorter box",
+    "layout": "T2-b-L1",
+    "layouts": [
+      "T2-b-L1",
+      "T2-b-L2",
+      "T2-b-L3",
+      "T2-b-L4",
+      "T2-b-L5",
+      "T2-b-L6"
+    ],
+    "datasets": [
+      "T2-b"
+    ],
+    "created": "2026-08-20 17:27",
+    "updated": "2026-08-25 15:40"
+  },
+  {
+    "id": "T3-a",
+    "prompt": "align the three colored blocks to the same orientation",
+    "layout": "T3-L1",
+    "layouts": [
+      "T3-L1",
+      "T3-a-L1",
+      "T3-a-L2",
+      "T3-a-L3",
+      "T3-a-L4",
+      "T3-a-L5",
+      "T3-a-L6"
+    ],
+    "datasets": [
+      "T3-a-25ep"
+    ],
+    "created": "2026-08-16 17:08",
+    "updated": "2026-08-25 15:41"
+  },
+  {
+    "id": "T3-b",
+    "prompt": "rotate the red block so that it is perpendicular to the blue block",
+    "layout": "T3-b-L1",
+    "layouts": [
+      "T3-b-L1",
+      "T3-b-L2",
+      "T3-b-L3",
+      "T3-b-L4",
+      "T3-b-L5",
+      "T3-b-L6"
+    ],
+    "datasets": [
+      "T3-b"
+    ],
+    "created": "2026-08-20 19:30",
+    "updated": "2026-08-25 15:42"
+  },
+  {
+    "id": "T4-a",
+    "prompt": "insert the orange block into the wooden shape sorter box",
+    "layout": "T4-L1",
+    "layouts": [
+      "T4-L1",
+      "T4-a-L1",
+      "T4-a-L2",
+      "T4-a-L3",
+      "T4-a-L4",
+      "T4-a-L5",
+      "T4-a-L6"
+    ],
+    "datasets": [
+      "T4-a-25ep"
+    ],
+    "created": "2026-08-16 17:30",
+    "updated": "2026-08-25 15:44"
+  },
+  {
+    "id": "T4-b",
+    "prompt": "insert the book into the black book stand",
+    "layout": "T4-b-L1",
+    "layouts": [
+      "T4-b-L1",
+      "T4-b-L2",
+      "T4-b-L3",
+      "T4-b-L4",
+      "T4-b-L5",
+      "T4-b-L6"
+    ],
+    "datasets": [
+      "T4-b"
+    ],
+    "created": "2026-08-20 18:34",
+    "updated": "2026-08-25 15:45"
+  },
+  {
+    "id": "T5-a",
+    "prompt": "pull the smaller book out of the black book stand",
+    "layout": "T5-L1",
+    "layouts": [
+      "T5-L1",
+      "T5-a-L1",
+      "T5-a-L2",
+      "T5-a-L3",
+      "T5-a-L4",
+      "T5-a-L5",
+      "T5-a-L6"
+    ],
+    "datasets": [
+      "T5-a-25ep"
+    ],
+    "created": "2026-08-16 16:01",
+    "updated": "2026-08-25 15:46"
+  },
+  {
+    "id": "T5-b",
+    "prompt": "pull the small block out from under the large block",
+    "layout": "T5-b-L1",
+    "layouts": [
+      "T5-b-L1",
+      "T5-b-L2",
+      "T5-b-L3",
+      "T5-b-L4",
+      "T5-b-L5",
+      "T5-b-L6"
+    ],
+    "datasets": [
+      "T5-b"
+    ],
+    "created": "2026-08-20 20:14",
+    "updated": "2026-08-25 15:47"
+  }
+]

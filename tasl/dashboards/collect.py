@@ -105,6 +105,14 @@ except ImportError:  # pragma: no cover - direct run from inside dashboards/
         write_dataset_layout,
     )
 
+# Task store — SHARED with the eval dashboard (openpi.py): both portals read
+# and write the same tasl/tasks_store.json, so a task defined here is
+# immediately selectable for eval and vice versa.
+try:
+    from dashboards.task_store import TaskStore
+except ImportError:  # pragma: no cover - direct run from inside dashboards/
+    from task_store import TaskStore  # type: ignore[no-redef]
+
 _log = logging.getLogger("collect_dashboard")
 
 # ── Hardware constants (verified 2026-05-27) ─────────────────────────
@@ -126,6 +134,11 @@ LIVE_CAM_DIR_HOST = f"{DATA_DIR_HOST}/outputs/live_cam"
 # <id>.json (+ <id>.jpg) per layout. Kept beside the data, not in the code
 # checkout, for the same reason datasets are: a code swap must not lose them.
 LAYOUT_DIR_HOST = os.environ.get("RLINF_LAYOUT_DIR", f"{DATA_DIR_HOST}/layouts")
+# Demo exports (save-video / save-layout buttons) — shared with openpi.py.
+DEMO_DIR = os.environ.get(
+    "RLINF_DEMO_DIR",
+    os.path.join(os.path.dirname(os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__)))), "saved_demo"))
 # Operator launchers, next door to this file (<repo>/tasl/launch). The session
 # endpoints SHELL OUT to these rather than reimplementing the kill set in
 # Python: "stopped" has exactly one definition, and the portal cannot drift
@@ -492,6 +505,155 @@ class LiveCamSource:
         except OSError:
             pass
         return self._placeholder
+
+
+class HDRolloutRecorder:
+    """Sidecar HD demo recorder for collection episodes.
+
+    The dataset keeps only 224x224 per view — fine for training, useless for
+    demo videos. During a recording window (开始记录 → 标记成功/丢弃/Stop)
+    this samples the FULL-RES live_cam JPEGs the in-container env already
+    writes for the dashboard preview (1280x720 per view), tiles them
+    side-by-side and writes a TEMP mp4. Save-video promotes the temp into
+    saved_demo/<task>/; starting the next recording quietly discards an
+    unpromoted one. Pure sidecar: it drops frames when a read misses and
+    never touches the env, the cameras, or the dataset.
+    """
+
+    TMP_NAME = "hd_rollout_tmp.mp4"
+
+    def __init__(self, live_source, tmp_dir: str, fps: float = 15.0):
+        self.live = live_source
+        self.tmp_dir = tmp_dir
+        self.fps = fps
+        self._lock = threading.Lock()
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+        self._last: Optional[dict] = None
+        # A temp from a previous dashboard life is unowned — drop it.
+        try:
+            os.makedirs(tmp_dir, exist_ok=True)
+            for fn in os.listdir(tmp_dir):
+                os.unlink(os.path.join(tmp_dir, fn))
+        except OSError:
+            pass
+
+    def _tmp_path(self) -> str:
+        return os.path.join(self.tmp_dir, self.TMP_NAME)
+
+    @staticmethod
+    def _decode(buf):
+        import cv2
+        import numpy as np
+        if not buf:
+            return None
+        img = cv2.imdecode(np.frombuffer(buf, np.uint8), cv2.IMREAD_COLOR)
+        # LiveCamSource hands back an 8x8 placeholder for a stale feed.
+        if img is None or img.shape[0] < 100:
+            return None
+        return img
+
+    def start(self, task_id: str, dataset: str) -> None:
+        if not HAS_CV2 or self.live is None:
+            return
+        with self._lock:
+            if self._running:
+                return
+            self._discard_locked()      # new take replaces an unsaved one
+            self._running = True
+            self._meta = {"task": task_id or "", "dataset": dataset or "",
+                          "started": time.strftime("%Y%m%d_%H%M%S")}
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        import cv2
+        import numpy as np
+        writer = None
+        frames = 0
+        # VideoWriter picks the container from the extension — the in-progress
+        # name must still end in .mp4.
+        path = os.path.join(self.tmp_dir, "in-progress." + self.TMP_NAME)
+        dt = 1.0 / self.fps
+        nxt = time.time()
+        while self._running:
+            ext = self._decode(self.live.get_jpeg("exterior"))
+            wrist = self._decode(self.live.get_jpeg("wrist"))
+            tile = None
+            if ext is not None:
+                if wrist is not None:
+                    h = ext.shape[0]
+                    wr = cv2.resize(
+                        wrist, (int(wrist.shape[1] * h / wrist.shape[0]), h))
+                    tile = np.concatenate([ext, wr], axis=1)
+                else:
+                    tile = ext
+            if tile is not None:
+                if writer is None:
+                    writer = cv2.VideoWriter(
+                        path, cv2.VideoWriter_fourcc(*"mp4v"), self.fps,
+                        (tile.shape[1], tile.shape[0]))
+                    if not writer.isOpened():
+                        _log.error("HD rollout VideoWriter open failed")
+                        writer = None
+                        break
+                writer.write(tile)
+                frames += 1
+            nxt += dt
+            delay = nxt - time.time()
+            if delay > 0:
+                time.sleep(min(delay, 1.0))
+            else:
+                nxt = time.time()
+        if writer is not None:
+            writer.release()
+        with self._lock:
+            if frames > 0:
+                try:
+                    os.replace(path, self._tmp_path())
+                    self._last = dict(self._meta, path=self._tmp_path(),
+                                      frames=frames)
+                    _log.info(f"HD rollout temp: {frames} frames "
+                              f"({self._meta['task']}/{self._meta['dataset']})")
+                except OSError as e:
+                    _log.warning(f"HD rollout finalize failed: {e}")
+            else:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+
+    def stop(self) -> None:
+        self._running = False
+        t = self._thread
+        if t is not None:
+            t.join(timeout=3.0)
+            self._thread = None
+
+    def last(self) -> Optional[dict]:
+        with self._lock:
+            return dict(self._last) if self._last else None
+
+    def promote(self, dest: str) -> Optional[str]:
+        """Move the finalized temp to `dest`; returns dest or None."""
+        with self._lock:
+            if not self._last:
+                return None
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            try:
+                shutil.move(self._last["path"], dest)
+            except OSError as e:
+                _log.warning(f"HD rollout promote failed: {e}")
+                return None
+            self._last = None
+            return dest
+
+    def _discard_locked(self) -> None:
+        self._last = None
+        try:
+            os.unlink(self._tmp_path())
+        except OSError:
+            pass
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1920,7 +2082,7 @@ INDEX_HTML = """<!doctype html>
 <body>
 <h1>TASL FR3 — 数据采集 dashboard</h1>
 
-<div class="row">
+<div class="row" style="margin-top:16px">
   <div class="col ctl">
     <h3>状态</h3>
     <div id="status">loading...</div>
@@ -1931,10 +2093,10 @@ INDEX_HTML = """<!doctype html>
     <button id="markSuccessBtn" class="marksuccess"
             onclick="markSuccess()">③ 标记成功 (注入 'c')</button>
     <button id="discardEpBtn" class="discardep"
-            onclick="markDiscard()">✗ 丢弃本条 (注入 'a')</button>
+            onclick="markDiscard()">✗ 标记失败/丢弃本条 (注入 'a')</button>
   </div>
   <div class="col ctl">
-    <h3>采集控制</h3>
+    <h3>数据采集</h3>
     <label>Episode 数</label>
     <input type="number" id="numEpisodes" value="10" min="1"/>
     <label>数据集 (一个任务一个数据集)</label>
@@ -1943,12 +2105,19 @@ INDEX_HTML = """<!doctype html>
     </select>
     <input type="text" id="newDatasetName"
            placeholder="新数据集名 (字母/数字/._-，如 fr3_stackcube_v1)"/>
-    <label>任务描述 (语言指令)</label>
-    <input type="text" id="taskDesc" value="pick up the cube"/>
+    <label>任务描述 (由上方 Task 决定)</label>
+    <input type="text" id="taskDesc" readonly placeholder="选择任务后自动填充"/>
     <div>
       <button class="primary" id="btnStart" onclick="startCollect()"
               disabled title="需要先完成 Layout 准备并「确认就位」">Start</button>
       <button class="danger" onclick="stopCollect()">Stop</button>
+      <button onclick="robotHome()">⌂ Go home</button>
+    </div>
+    <div style="margin-top:6px">
+      <button id="btnSaveVideo" onclick="saveVideo()" disabled
+              title="Stop / 标记成功 / 标记失败 之后可保存,下次开始记录前有效">
+        💾 保存 demo 视频</button>
+      <button onclick="saveLayoutDemo()">🗺 保存 layout</button>
     </div>
     <div id="actionMsg" style="font-size:0.8rem;color:#888;margin-top:8px"></div>
   </div>
@@ -1956,8 +2125,35 @@ INDEX_HTML = """<!doctype html>
 
 <div class="row" style="margin-top:16px">
   <div class="col ctl" id="layout-panel" style="flex:1 1 100%">
-    <h3>Layout 准备（物体摆位）<span id="layoutState"
+    <h3>Task + Layout 准备（任务 · 物体摆位）<span id="layoutState"
         class="lstate none">未选择</span></h3>
+
+    <div id="taskArea" style="margin-bottom:10px; padding-bottom:10px;
+         border-bottom:1px solid #262626">
+      <div style="display:flex; gap:6px; align-items:center">
+        <select id="taskSel" onchange="onTaskSelect()" style="flex:1; margin-bottom:0"></select>
+        <button class="small primary" onclick="taskNewOpen()">＋ New task</button>
+        <button class="small danger" onclick="deleteTask()">删除</button>
+      </div>
+      <div id="taskInfo" style="font-size:0.8rem;color:#888;margin-top:4px">
+        选择任务 → prompt 锁定 + 自动加载最近 layout;一个任务可对应多个
+        layout,「确认就位」时自动挂到任务。</div>
+      <div id="taskForm" style="display:none; border:1px solid #262626;
+           border-radius:6px; padding:8px; margin-top:6px">
+        <label>新任务 prompt(语言指令)</label>
+        <input type="text" id="taskPrompt" placeholder="如 pick up the cube"/>
+        <label>task id(留空自动生成)</label>
+        <input type="text" id="taskId" placeholder="如 pick-up-the-cube"/>
+        <div style="font-size:0.8rem;color:#888;margin:4px 0">
+          layout:在下方新建/加载好后,保存任务时挂上当前 layout 作为第一个;
+          之后每次「确认就位」用的 layout 都会自动累积到任务名下。
+          任务库与 eval 端共享(tasl/tasks_store.json)。</div>
+        <div>
+          <button class="small primary" onclick="saveNewTask()">保存新任务</button>
+          <button class="small" onclick="taskNewClose()">取消</button>
+        </div>
+      </div>
+    </div>
 
     <div id="camCtl" style="margin-bottom:10px; padding-bottom:10px;
          border-bottom:1px solid #262626">
@@ -1974,11 +2170,11 @@ INDEX_HTML = """<!doctype html>
       <label>加载已有 layout</label>
       <div style="display:flex; gap:6px; align-items:center">
         <select id="layoutSel" style="flex:1; margin-bottom:0"></select>
-        <button class="small" onclick="layoutLoad()">加载</button>
-        <button class="small danger" onclick="layoutDelete()">删除</button>
+        <button class="small" id="btnLayoutLoad" onclick="layoutLoad()">加载</button>
+        <button class="small danger" id="btnLayoutDel" onclick="layoutDelete()">删除</button>
       </div>
-      <button class="primary" onclick="layoutNew()">＋ 新建 Layout</button>
-      <button onclick="layoutEditCurrent()">编辑当前</button>
+      <button class="primary" id="btnLayoutNew" onclick="layoutNew()">＋ 新建 Layout</button>
+      <button id="btnLayoutEdit" onclick="layoutEditCurrent()">编辑当前</button>
     </div>
 
     <div id="layoutEditor" style="display:none">
@@ -2162,9 +2358,109 @@ async function api(path, body) {
   return j;
 }
 
+// ── Task 区域(与 eval 端共享任务库)────────────────────────────────
+// 选中任务 → prompt 只读锁定 + 自动加载其 layout 蒙版;layout 的
+// 新建/编辑/删除只在 New task 模式开放(确认就位不受影响)。
+let taskList = [];
+let taskNewMode = false;
+const jsSlug = s => (s || '').toLowerCase().replace(/[^a-z0-9]+/g, '-')
+  .replace(/^-+|-+$/g, '') || '';
+function selectedTask() {
+  const id = document.getElementById('taskSel').value;
+  return taskList.find(t => t.id === id);
+}
+async function taskRefresh() {
+  try {
+    const r = await fetch('/api/tasks');
+    const j = await r.json();
+    taskList = j.tasks || [];
+    const sel = document.getElementById('taskSel');
+    const cur = sel.value;
+    sel.innerHTML = '<option value="">(选择任务)</option>' + taskList.map(t =>
+      '<option value="' + esc(t.id) + '">' + esc(t.id) + '</option>').join('');
+    if (cur && taskList.some(t => t.id === cur)) sel.value = cur;
+  } catch (e) {}
+}
+function renderTaskInfo(t) {
+  const info = document.getElementById('taskInfo');
+  if (!t) {
+    info.textContent = '选择任务 → prompt 锁定 + 自动加载最近 layout;'
+      + '一个任务可对应多个 layout,「确认就位」时自动挂到任务。';
+    return;
+  }
+  const lays = t.layouts || [];
+  info.textContent = 'prompt: ' + t.prompt
+    + ' · layouts(' + lays.length + '): ' + (lays.join(', ') || '—')
+    + ' · datasets: ' + ((t.datasets || []).join(', ') || '—');
+}
+async function onTaskSelect() {
+  taskNewClose();
+  const t = selectedTask();
+  renderTaskInfo(t);
+  if (!t) {
+    document.getElementById('taskDesc').value = '';
+    loadLayoutList();
+    return;
+  }
+  document.getElementById('taskDesc').value = t.prompt;
+  await loadLayoutList();   // 重建分组(本任务的 layouts 排最前)
+  if (t.layout) {
+    const sel = document.getElementById('layoutSel');
+    if ([...sel.options].some(o => o.value === t.layout)) {
+      sel.value = t.layout;
+      await layApi('/api/layout/select', {id: t.layout});
+      refresh();
+      layMsg('最近使用的 layout「' + t.layout + '」已加载 — 换一个直接选+加载,'
+        + '或新建;开启相机预览可见蒙版,摆好后点「确认就位」');
+    } else {
+      layMsg('任务最近的 layout「' + t.layout + '」已不存在 — 在下方另选或新建');
+    }
+  } else {
+    layMsg('任务「' + t.id + '」还没有用过 layout — 在下方选择或新建一个,'
+      + '「确认就位」时会自动挂到任务');
+  }
+}
+function taskNewOpen() {
+  taskNewMode = true;
+  document.getElementById('taskSel').value = '';
+  document.getElementById('taskForm').style.display = '';
+  document.getElementById('taskPrompt').value = '';
+  document.getElementById('taskId').value = '';
+  document.getElementById('taskDesc').value = '';
+  document.getElementById('taskPrompt').focus();
+}
+function taskNewClose() {
+  taskNewMode = false;
+  document.getElementById('taskForm').style.display = 'none';
+}
+async function saveNewTask() {
+  const prompt = document.getElementById('taskPrompt').value.trim();
+  if (!prompt) { alert('prompt 不能为空'); return; }
+  const id = document.getElementById('taskId').value.trim() || jsSlug(prompt);
+  if (!id) { alert('task id 不能为空'); return; }
+  const layout = (LAY.selected || document.getElementById('layoutSel').value || '');
+  const j = await api('/api/task/create', {id, prompt, layout, datasets: []});
+  if (j.ok) {
+    await taskRefresh();
+    document.getElementById('taskSel').value = id;
+    onTaskSelect();
+  }
+}
+async function deleteTask() {
+  const id = document.getElementById('taskSel').value;
+  if (!id) { alert('先选择要删除的任务'); return; }
+  if (!confirm('删除任务「' + id + '」?(不影响数据集和 layout 文件)')) return;
+  const j = await api('/api/task/delete', {id});
+  if (j.ok) {
+    await taskRefresh();
+    document.getElementById('taskSel').value = '';
+    onTaskSelect();
+  }
+}
+
 // Dataset selector: '__new__' reveals the name input; picking an existing
-// dataset hides it and auto-fills the task instruction from that dataset so a
-// re-collection reuses the exact task string (no duplicate tasks.jsonl row).
+// dataset hides it. The task instruction comes from the Task 区域 — the old
+// per-dataset autofill only kicks in when no task is selected (legacy sets).
 function onDatasetSel() {
   const sel = document.getElementById('datasetSel');
   const inp = document.getElementById('newDatasetName');
@@ -2173,7 +2469,9 @@ function onDatasetSel() {
   } else {
     inp.style.display = 'none';
     const d = dsCache.find(x => x.category === 'current' && x.name === sel.value);
-    if (d && d.task) document.getElementById('taskDesc').value = d.task;
+    if (d && d.task && !document.getElementById('taskSel').value) {
+      document.getElementById('taskDesc').value = d.task;
+    }
   }
 }
 
@@ -2203,8 +2501,12 @@ function currentDatasetName() {
 
 async function startCollect() {
   const n = parseInt(document.getElementById('numEpisodes').value, 10);
+  const tid = document.getElementById('taskSel').value;
   const task = document.getElementById('taskDesc').value.trim();
   const ds = currentDatasetName();
+  if (!tid) {
+    alert('请先在 Task 区选择任务(或 New task 新建并保存)'); return;
+  }
   if (!n || n < 1) { alert('Episode 数必须 >= 1'); return; }
   if (!ds) { alert('请选择或新建一个数据集'); return; }
   if (!/^[A-Za-z0-9._-]+$/.test(ds)) {
@@ -2215,17 +2517,43 @@ async function startCollect() {
     alert('Layout 准备未完成 — 请先选择/新建 layout，摆好物体后点「确认就位」');
     return;
   }
-  return api('/api/collect/start',
-             {num_episodes: n, task_description: task, dataset_name: ds});
+  const j = await api('/api/collect/start',
+                      {num_episodes: n, task_description: task, dataset_name: ds,
+                       task_id: tid});
+  if (j && j.ok !== false) setSaveVideo(false);
+  return j;
 }
 
 async function stopCollect() {
   if (!confirm('确认停止采集？(kill 进程 + ray cleanup)')) return;
-  return api('/api/collect/stop');
+  const j = await api('/api/collect/stop');
+  if (j && j.ok !== false) setSaveVideo(true);
+  return j;
+}
+
+// ── Demo 导出(RLinf/saved_demo)──────────────────────────────────────
+// 保存视频只在 Stop / 标记成功 / 标记失败 之后可点,下次开始记录时重新禁用;
+// 保存 layout 全程可点。视频来自数据集最新一条 episode(数据集原生分辨率)。
+function setSaveVideo(on) {
+  const el = document.getElementById('btnSaveVideo');
+  if (el) el.disabled = !on;
+}
+async function saveVideo() {
+  const ds = currentDatasetName();
+  if (!ds) { alert('请先选择数据集'); return; }
+  return api('/api/save_video',
+             {dataset: ds, task_id: document.getElementById('taskSel').value});
+}
+async function saveLayoutDemo() {
+  const lay = LAY.selected || document.getElementById('layoutSel').value;
+  if (!lay) { alert('还没有选择 layout'); return; }
+  return api('/api/save_layout',
+             {layout: lay, task_id: document.getElementById('taskSel').value});
 }
 
 async function markSuccess() {
   const j = await api('/api/mark_success');
+  if (j && j.ok !== false) setSaveVideo(true);
   if (j && j.caveat) {
     document.getElementById('actionMsg').textContent =
       (j.msg || '') + ' — ' + j.caveat;
@@ -2242,6 +2570,7 @@ async function markStartEpisode() {
 
 async function markStartRecording() {
   const j = await api('/api/start_recording');
+  if (j && j.ok !== false) setSaveVideo(false);
   if (j && j.caveat) {
     document.getElementById('actionMsg').textContent =
       (j.msg || '') + ' — ' + j.caveat;
@@ -2252,6 +2581,7 @@ async function markDiscard() {
   if (!confirm('丢弃本条？\\n\\n这一条不会保存，机械臂会复位重来。\\n'
       + '（比录完再删安全：数据集里根本不会出现它）')) return;
   const j = await api('/api/discard_episode');
+  if (j && j.ok !== false) setSaveVideo(true);
   if (j && j.caveat) {
     document.getElementById('actionMsg').textContent =
       (j.msg || '') + ' — ' + j.caveat;
@@ -2445,19 +2775,36 @@ async function loadLayoutList() {
     layCache = j.layouts || [];
     const sel = document.getElementById('layoutSel');
     const prev = sel.value;
-    sel.innerHTML = layCache.length
-      ? layCache.map(function (l) {
-          if (l.error) return '<option value="' + esc(l.id) + '">'
-                             + esc(l.id) + '  (损坏)</option>';
-          const n = l.n_objects || {};
-          const snap = l.has_snapshot || {};
-          const shots = VIEWS.filter(function (v) { return snap[v]; });
-          return '<option value="' + esc(l.id) + '">' + esc(l.id)
-            + '  — 外部 ' + (n.exterior || 0) + ' / 腕部 ' + (n.wrist || 0)
-            + (shots.length ? ' · 快照 ' + shots.join('+') : '')
-            + '</option>';
-        }).join('')
-      : '<option value="">(还没有 layout — 点「新建」)</option>';
+    const opt = function (l, star) {
+      if (l.error) return '<option value="' + esc(l.id) + '">'
+                         + esc(l.id) + '  (损坏)</option>';
+      const n = l.n_objects || {};
+      const snap = l.has_snapshot || {};
+      const shots = VIEWS.filter(function (v) { return snap[v]; });
+      return '<option value="' + esc(l.id) + '">' + (star ? '★ ' : '')
+        + esc(l.id)
+        + '  — 外部 ' + (n.exterior || 0) + ' / 腕部 ' + (n.wrist || 0)
+        + (shots.length ? ' · 快照 ' + shots.join('+') : '')
+        + '</option>';
+    };
+    // 分组:当前任务用过的 layouts 排最前(★),其余在后。
+    const t = selectedTask();
+    const mine = new Set((t && t.layouts) || []);
+    const ours = layCache.filter(l => mine.has(l.id));
+    const rest = layCache.filter(l => !mine.has(l.id));
+    let html = '';
+    if (ours.length) {
+      html += '<optgroup label="本任务用过的 layouts">'
+        + ours.map(l => opt(l, true)).join('') + '</optgroup>';
+      html += rest.length
+        ? '<optgroup label="其他 layouts">'
+          + rest.map(l => opt(l, false)).join('') + '</optgroup>'
+        : '';
+    } else {
+      html = layCache.map(l => opt(l, false)).join('');
+    }
+    sel.innerHTML = html
+      || '<option value="">(还没有 layout — 点「新建」)</option>';
     if (layCache.some(l => l.id === prev)) sel.value = prev;
   } catch (e) { layMsg('layout 列表加载失败: ' + e); }
 }
@@ -2829,7 +3176,13 @@ async function layoutDelete() {
 }
 
 async function layoutConfirm() {
-  await layApi('/api/layout/confirm');
+  const tid = document.getElementById('taskSel').value;
+  const j = await layApi('/api/layout/confirm', tid ? {task_id: tid} : null);
+  if (j && j.ok && tid) {
+    await taskRefresh();               // layouts 列表可能新增了这一个
+    renderTaskInfo(selectedTask());
+    loadLayoutList();
+  }
   refresh();
 }
 
@@ -2993,6 +3346,7 @@ VIEWS.forEach(function (v) {
 document.addEventListener('mousemove', onStencilMove);
 document.addEventListener('mouseup', onStencilUp);
 loadLayoutList();
+taskRefresh().then(() => renderTaskInfo(selectedTask()));
 refresh(); setInterval(refresh, 1500);
 
 // -- dataset manager ---------------------------------------------------
@@ -3245,6 +3599,12 @@ def build_app(cams: CamManager, mgr: CollectionManager,
         dataset_roots = list(DATASET_ROOTS)
     if layout_gate is None:
         layout_gate = LayoutGate(LayoutStore(LAYOUT_DIR_HOST))
+    task_store = TaskStore()
+    # Sidecar HD demo recorder over the env's live_cam frames; one temp slot,
+    # promoted by save-video or replaced by the next recording window.
+    hd_rec = HDRolloutRecorder(live_cams, os.path.join(DEMO_DIR, ".tmp"))
+    # Task the current run was started under (for the HD temp's metadata).
+    run_task = {"id": ""}
     app = Flask(__name__)
 
     # Robot-state cache for the 1.5s status poll: at most one zerorpc
@@ -3508,14 +3868,164 @@ def build_app(cams: CamManager, mgr: CollectionManager,
             return jsonify({"ok": False,
                             "msg": "采集进行中 — 无法重新确认 layout"}), 409
         layout_id = layout_gate.confirm()
+        # Confirming under a selected task = "this run of the task uses this
+        # layout" — record it (a task accumulates many layouts over time).
+        body = request.get_json(silent=True) or {}
+        task_id = str(body.get("task_id", "")).strip()
+        extra = ""
+        if task_id and task_store.add_layout(task_id, layout_id) == "updated":
+            extra = f"(已挂到任务 {task_id})"
         return jsonify({"ok": True,
-                        "msg": f"layout '{layout_id}' 已确认就位 — Start 已解锁"})
+                        "msg": f"layout '{layout_id}' 已确认就位 — "
+                               f"Start 已解锁{extra}"})
 
     @app.post("/api/layout/clear")
     @_layout_err
     def api_layout_clear():
         layout_gate.clear()
         return jsonify({"ok": True, "msg": "已取消 layout 选择"})
+
+    # -- tasks (shared registry with the eval dashboard) ------------------
+    @app.get("/api/tasks")
+    def api_tasks():
+        return jsonify({"tasks": task_store.list()})
+
+    @app.post("/api/task/create")
+    def api_task_create():
+        body = request.get_json(silent=True) or {}
+        msg = task_store.create(body)
+        return jsonify({"ok": msg == "created", "msg": msg})
+
+    @app.post("/api/task/delete")
+    def api_task_delete():
+        body = request.get_json(silent=True) or {}
+        msg = task_store.delete(str(body.get("id", "")).strip())
+        return jsonify({"ok": msg == "deleted", "msg": msg})
+
+    @app.post("/api/task/update")
+    def api_task_update():
+        body = request.get_json(silent=True) or {}
+        msg = task_store.update(str(body.get("id", "")).strip(), body)
+        return jsonify({"ok": msg == "updated", "msg": msg})
+
+    # -- demo exports → RLinf/saved_demo/<task>/ --------------------------
+    @app.post("/api/save_video")
+    def api_save_video():
+        """Save the last episode's demo video.
+
+        Preferred source: the sidecar HD temp (1280x720 per view, sampled
+        from the env's live_cam frames during the recording window). Falls
+        back to re-encoding the newest dataset episode (224x224 native) when
+        no HD temp exists — e.g. the dashboard restarted mid-session.
+        """
+        if not (HAS_PYARROW and HAS_CV2):
+            return jsonify({"ok": False,
+                            "msg": "pyarrow/cv2 not installed on this host"}), 503
+        body = request.get_json(silent=True) or {}
+        dsid = str(body.get("dataset", "")).strip()
+        task_id = str(body.get("task_id", "")).strip()
+        hd = hd_rec.last()
+        if hd is not None:
+            folder = task_id or hd["task"] or (hd["dataset"] or dsid or "untagged")
+            dest = os.path.join(
+                DEMO_DIR, folder,
+                f"{(hd['dataset'] or dsid or 'episode')}_{hd['started']}_hd.mp4")
+            out = hd_rec.promote(dest)
+            if out is not None:
+                return jsonify({"ok": True, "path": out,
+                                "msg": (f"saved HD demo({hd['frames']} 帧, "
+                                        f"720p 双视角) → {out}")})
+        # -- fallback: dataset-native re-encode ---------------------------
+        # 采集控制面板传的是裸数据集名(不是数据集管理器的编码 dsid)——按
+        # 采集写入根目录解析,与 /api/collect/start 的语义一致。
+        if not _valid_dataset_name(dsid):
+            return jsonify({"ok": False, "msg": f"invalid dataset name '{dsid}'"}), 400
+        ds_dir = os.path.join(dataset_roots[0], dsid)
+        if not os.path.isfile(os.path.join(ds_dir, "meta", "info.json")):
+            return jsonify({"ok": False,
+                            "msg": f"数据集 '{dsid}' 不存在或还没有元数据"
+                                   "(第一条 episode 保存后才有)"}), 404
+        try:
+            with open(os.path.join(ds_dir, "meta", "info.json")) as f:
+                info = json.load(f)
+        except Exception as e:
+            return jsonify({"ok": False,
+                            "msg": f"info.json unreadable: {e!r}"[:300]}), 500
+        total = int(info.get("total_episodes") or 0)
+        if total < 1:
+            return jsonify({"ok": False, "msg": "数据集还没有已保存的 episode"}), 404
+        n = total - 1
+        epath = _episode_parquet_path(ds_dir, info, n)
+        if not os.path.isfile(epath):
+            return jsonify({"ok": False, "msg": f"episode {n} 文件缺失"}), 404
+        image_keys = _image_keys(info)
+        if not image_keys:
+            return jsonify({"ok": False, "msg": "dataset has no image features"}), 404
+        fps = float(info.get("fps") or 15)
+        out_dir = os.path.join(DEMO_DIR, task_id or dsid.replace("/", "_"))
+        os.makedirs(out_dir, exist_ok=True)
+        out = os.path.join(out_dir,
+                           f"{dsid.replace('/', '_')}_ep{n:03d}.mp4")
+        import cv2
+        import pyarrow.parquet as pq
+        writer = None
+        frames = 0
+        pf = pq.ParquetFile(epath)
+        try:
+            for batch in pf.iter_batches(batch_size=32, columns=image_keys):
+                for row in batch.to_pylist():
+                    tiles = [img for k in image_keys
+                             if (img := _decode_image_cell(row.get(k))) is not None]
+                    if not tiles:
+                        continue
+                    frame = _hstack_frames(tiles)
+                    if writer is None:
+                        writer = cv2.VideoWriter(
+                            out, cv2.VideoWriter_fourcc(*"mp4v"), fps,
+                            (frame.shape[1], frame.shape[0]))
+                        if not writer.isOpened():
+                            return jsonify({"ok": False,
+                                            "msg": "VideoWriter open failed"}), 500
+                    writer.write(frame)
+                    frames += 1
+        finally:
+            pf.close()
+            if writer is not None:
+                writer.release()
+        if not frames:
+            return jsonify({"ok": False, "msg": f"episode {n} 没有可解码的帧"}), 404
+        return jsonify({"ok": True, "path": out,
+                        "msg": (f"saved episode {n}({frames} 帧, 数据集原生分辨率)"
+                                f" → {out}")})
+
+    @app.post("/api/save_layout")
+    def api_save_layout():
+        """Export a layout (json + reference JPEGs) as a demo — usable anytime."""
+        body = request.get_json(silent=True) or {}
+        lay_id = str(body.get("layout", "")).strip()
+        task_id = str(body.get("task_id", "")).strip() or "untagged"
+        if not lay_id:
+            return jsonify({"ok": False, "msg": "还没有选择 layout"}), 400
+        try:
+            lay = layout_gate.store.load(lay_id)
+        except LayoutError as e:
+            return jsonify({"ok": False, "msg": str(e)}), 404
+        out_dir = os.path.join(DEMO_DIR, task_id)
+        os.makedirs(out_dir, exist_ok=True)
+        saved = []
+        p = os.path.join(out_dir, f"layout_{lay_id}.json")
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(lay, f, ensure_ascii=False, indent=2)
+        saved.append(os.path.basename(p))
+        for view in LAYOUT_VIEWS:
+            buf = layout_gate.store.snapshot_bytes(lay_id, view)
+            if buf:
+                q = os.path.join(out_dir, f"layout_{lay_id}.{view}.jpg")
+                with open(q, "wb") as f:
+                    f.write(buf)
+                saved.append(os.path.basename(q))
+        return jsonify({"ok": True, "path": out_dir,
+                        "msg": f"saved → {out_dir} ({', '.join(saved)})"})
 
     @app.post("/api/collect/start")
     def api_collect_start():
@@ -3545,10 +4055,18 @@ def build_app(cams: CamManager, mgr: CollectionManager,
             layout_gate.arm_dataset_write(
                 os.path.join(dataset_roots[0], dataset_name),
                 task, num_episodes)
+            # Task provenance: the run's dataset AND layout join the task's
+            # record so both portals list what was collected for it.
+            task_id = str(body.get("task_id", "")).strip()
+            run_task["id"] = task_id
+            if task_id:
+                task_store.add_dataset(task_id, dataset_name)
+                task_store.add_layout(task_id, gate_msg)  # check() ok → id
         return jsonify({"ok": code == 200, "msg": msg}), code
 
     @app.post("/api/collect/stop")
     def api_collect_stop():
+        hd_rec.stop()
         return jsonify({"ok": True, "msg": mgr.stop()})
 
     # -- session teardown -------------------------------------------------
@@ -3652,6 +4170,7 @@ def build_app(cams: CamManager, mgr: CollectionManager,
             vkbd.inject_success()
         except Exception as e:
             return jsonify({"ok": False, "msg": f"inject failed: {e!r}"[:300]}), 500
+        hd_rec.stop()   # episode over — finalize the HD demo temp
         # Advisory: report which device the KeyboardListener's scan rule
         # would pick, so the operator knows whether the injection lands.
         predicted = None
@@ -3734,6 +4253,10 @@ def build_app(cams: CamManager, mgr: CollectionManager,
             vkbd.inject_record()
         except Exception as e:
             return jsonify({"ok": False, "msg": f"inject failed: {e!r}"[:300]}), 500
+        # Recording window opens: start the sidecar HD demo recorder (an
+        # unsaved temp from the previous take is replaced).
+        hd_rec.start(run_task["id"],
+                     (mgr.last_launch or {}).get("dataset_name") or "")
         visible = vkbd_visible_in_container(vkbd.path)
         caveat = None if visible else (
             "virtual keyboard not visible inside rlinf-eval (container /dev is "
@@ -3761,6 +4284,7 @@ def build_app(cams: CamManager, mgr: CollectionManager,
             vkbd.inject_discard()
         except Exception as e:
             return jsonify({"ok": False, "msg": f"inject failed: {e!r}"[:300]}), 500
+        hd_rec.stop()   # episode over (discarded) — HD temp still savable
         visible = vkbd_visible_in_container(vkbd.path)
         caveat = None if visible else (
             "virtual keyboard not visible inside rlinf-eval (container /dev is "
