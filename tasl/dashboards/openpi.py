@@ -1901,6 +1901,8 @@ INDEX_HTML = """<!doctype html>
               title="导出当前选中 layout 的参考图(exterior/wrist jpg + json)→ saved_demo/<task>/">🖼 Save png</button>
       <button onclick="saveOodLayout()"
               title="把当前相机画面拍成该任务的 OOD layout(<task>-OODn),挂到任务上并作为 ghost;之后的 episode meta 记录该 layout">🌀 Save as OOD layout</button>
+      <button onclick="demoCompact()"
+              title="删除 rollout 后编号会留空;点这里把 saved_demo/<task> 和 <task>-ood 里每个 layout 的 _rNN 重排为连续(会改文件名)">🧹 整理 id</button>
       <span id="saveInfo" style="font-size:12px;color:var(--faint)"></span>
     </div>
     <div class="hint">Start 前先在上方选择任务;Mark ✓/✗ 写入最新一条 eval 录制的
@@ -2199,6 +2201,13 @@ function setSaveVideo(on) {
 async function saveVideo() {
   const j = await api('/save_video');
   if (j.ok) document.getElementById('saveInfo').textContent = j.msg;
+}
+async function demoCompact() {
+  const t = document.getElementById('taskSel').value;
+  if (!t) { toast('先在 Task 区选择任务', 'err'); return; }
+  if (!confirm('把 saved_demo/' + t + ' 和 ' + t + '-ood 里各 layout 的 rollout 编号重排为连续?(会重命名文件)')) return;
+  const j = await api('/demo/compact', {task: t});
+  if (j.ok) { document.getElementById('saveInfo').textContent = '🧹 ' + j.msg; epRefresh(); }
 }
 async function saveLayout() {
   const t = taskList.find(x => x.id === document.getElementById('taskSel').value);
@@ -3727,9 +3736,78 @@ def build_app(rs: RS, cams: CamManager, runner: EvalRunner,
         hit = _find_ep_meta(ep)
         if hit is None:
             return jsonify({"ok": False, "msg": "episode not found"}), 404
-        meta_f, _m = hit
+        meta_f, m = hit
+        removed = []
+        demo = m.get("demo") or {}
+        if demo.get("dir") and demo.get("stem"):
+            for f in _demo_files(pathlib.Path(demo["dir"]), demo["stem"]):
+                if f.exists():
+                    f.unlink()
+                    removed.append(f.name)
+        legacy_dir = pathlib.Path(DEMO_DIR) / (m.get("task") or "untagged")
+        if legacy_dir.is_dir():
+            for f in legacy_dir.glob(f"{ep}.*"):   # pre-2026-08-27 exports: <ep_id>.*
+                f.unlink()
+                removed.append(f.name)
         shutil.rmtree(meta_f.parent)
-        return jsonify({"ok": True, "msg": "deleted"})
+        _log.info(f"episode deleted: {ep}" + (f" + demo files {removed}" if removed else ""))
+        return jsonify({"ok": True, "removed_demo": removed,
+                        "msg": f"deleted {ep}" + (f" + saved_demo: {', '.join(removed)}" if removed else "")})
+
+    @app.post("/demo/compact")
+    def demo_compact():
+        """Renumber saved_demo/<task>/ and <task>-ood/ so every layout's
+        rollouts are <layout>_r01.. without gaps (after deletions). Two-phase
+        rename; the exported json and the episode meta.json are updated."""
+        body = request.get_json(silent=True) or {}
+        task = (body.get("task") or "").strip()
+        if not task:
+            return jsonify({"ok": False, "msg": "task required"}), 400
+        pat = re.compile(r"^(?P<base>.+)_r(?P<n>\d+)$")
+        renamed = []
+        for sub in (task, f"{task}-ood"):
+            d = pathlib.Path(DEMO_DIR) / sub
+            if not d.is_dir():
+                continue
+            groups: dict = {}
+            for jf in d.glob("*.json"):
+                if jf.name.endswith(".frames.json") or jf.name.startswith("layout_"):
+                    continue
+                mm = pat.match(jf.stem)
+                if mm:
+                    groups.setdefault(mm.group("base"), []).append((int(mm.group("n")), jf.stem))
+            for base, items in groups.items():
+                items.sort()
+                plan = [(old, f"{base}_r{i:02d}") for i, (_n, old) in enumerate(items, 1)
+                        if old != f"{base}_r{i:02d}"]
+                if not plan:
+                    continue
+                staged = []
+                for old, new in plan:
+                    for f in list(d.glob(f"{old}.*")):
+                        t = d / f"__compact__{f.name}"
+                        f.rename(t)
+                        staged.append((t, new + f.name[len(old):]))
+                for t, final in staged:
+                    t.rename(d / final)
+                for old, new in plan:
+                    jf = d / f"{new}.json"
+                    try:
+                        mj = json.loads(jf.read_text(encoding="utf-8"))
+                        mj["demo"] = {"dir": str(d), "stem": new}
+                        jf.write_text(json.dumps(mj, ensure_ascii=False, indent=2), encoding="utf-8")
+                        hit = _find_ep_meta(mj.get("ep_id") or "")
+                        if hit is not None:
+                            mf, mm2 = hit
+                            mm2["demo"] = {"dir": str(d), "stem": new}
+                            _write_meta(mf, mm2)
+                    except Exception as e:  # noqa: BLE001
+                        _log.warning(f"demo compact: json update failed for {new}: {e}")
+                    renamed.append(f"{sub}/{old} → {new}")
+        _log.info(f"demo compact {task}: {renamed}")
+        return jsonify({"ok": True, "renamed": renamed,
+                        "msg": (f"{len(renamed)} 个 rollout 重新编号: " + "; ".join(renamed))
+                               if renamed else "编号已经连续,无需整理"})
 
     # Robot/gripper panel data comes from droid_nuc zerorpc (the old
     # robot_server HTTP on :4242 is gone — that port is now the zerorpc
