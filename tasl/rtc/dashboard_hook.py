@@ -179,6 +179,8 @@ def run_episode(runner, prompt: str, policy) -> None:
                 runner._last_error = wd  # noqa: SLF001
                 _log.error(wd)
                 runner._stop.set()  # noqa: SLF001
+        runner.note_actions(np.asarray(rec["actions"]), "rtc", iter=rec["n_infer"],
+                            infer_ms=float(rec["infer_ms"]), s=rec.get("s"), d=rec.get("d"))
         if recorder is None:
             return
         recorder.log_step({

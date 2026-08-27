@@ -483,6 +483,9 @@ class EvalRunner:
         self._tag: Optional[dict] = None
         # Per-iter knobs (sane defaults; overridable later via /config).
         self.open_loop_horizon = 4
+        # Raw policy chunks (before clip/scale) for the portal's action panel.
+        self.action_log: collections.deque = collections.deque(maxlen=40)
+        self._action_seq = 0
         # "pad" (DROID-style, default) or "crop" (pbc ckpts) — set per Start.
         self.image_mode = "pad"
         # DROID's controller (droid/franka/robot.py + robot_ik_solver.py):
@@ -640,6 +643,7 @@ class EvalRunner:
                 return "homing in progress — wait for the arm to reach home, then Start"
             self._wd_reset()
             self.motion.reset()
+            self.action_log.clear()
             self._tag = tag
             # Bootstrap the droid_nuc container — first call spawns the
             # polymetis driver + Robotiq driver inside the container; no-op
@@ -709,6 +713,22 @@ class EvalRunner:
 
         threading.Thread(target=_halt, daemon=True).start()
         return "stop signal sent"
+
+    def note_actions(self, actions, src: str, **extra) -> None:
+        """Append one raw policy chunk (H, 8) to the action ring buffer shown
+        under the console. Values are the policy's own output (joint-velocity
+        units in [-1, 1] + gripper [0, 1]), before clip / delta_scale."""
+        try:
+            a = np.asarray(actions, dtype=np.float64)
+            self._action_seq += 1
+            rec = {"seq": self._action_seq, "t": round(time.time(), 3), "src": src,
+                   "shape": list(a.shape),
+                   "values": np.round(a, 3).tolist() if a.ndim == 2 else []}
+            for k, v in extra.items():
+                rec[k] = round(float(v), 1) if isinstance(v, float) else v
+            self.action_log.append(rec)
+        except Exception:  # noqa: BLE001 — diagnostics must never break the loop
+            pass
 
     def status(self) -> dict:
         return {
@@ -872,6 +892,7 @@ class EvalRunner:
                     )
                     _log.error(self._last_error)
                     break
+                self.note_actions(actions, "sync", infer_ms=self._last_infer_ms)
 
                 if self._stop.is_set():
                     break
@@ -1953,6 +1974,12 @@ INDEX_HTML = """<!doctype html>
   </div>
 </div>
 
+<div class="card" id="actionsCard">
+  <h3>Action chunks(policy 每次推理输出的原始 chunk)
+    <span class="hint" id="actionsHint" style="font-weight:normal;margin-left:8px">— no inference yet —</span></h3>
+  <pre class="console" id="actionsBox" style="max-height:280px">— waiting for the first inference —</pre>
+</div>
+
 <div class="card">
   <h3>Episodes(eval 视频)
     <span style="font-size:12px;color:var(--faint);font-weight:400">— 每次 Stop 自动录制双视角拼接视频,按 task 分类</span></h3>
@@ -2900,6 +2927,39 @@ async function logsPoll() {
 }
 
 refresh(); ckptRefresh(); logsPoll(); taskRefresh(); maskRefresh(); epRefresh();
+// ── Action chunk 面板(policy 原始输出,clip / delta_scale 之前)────────────
+let _actSeq = 0, _actChunks = [];
+async function actionsPoll() {
+  try {
+    const j = await (await fetch('/actions?since=' + _actSeq)).json();
+    const items = j.items || [];
+    if (!items.length) return;
+    _actSeq = j.seq;
+    _actChunks = _actChunks.concat(items).slice(-3);   // 只留最近 3 个 chunk
+    const fmt = v => (v >= 0 ? ' ' : '') + Number(v).toFixed(3);
+    const lines = [];
+    for (let c = _actChunks.length - 1; c >= 0; c--) {
+      const a = _actChunks[c];
+      const H = a.shape[0], D = a.shape[1] || 8;
+      lines.push('#' + a.seq + '  ' + a.src + (a.iter !== undefined ? '  iter ' + a.iter : '')
+        + '  chunk = ' + H + ' × ' + D
+        + '  infer ' + (a.infer_ms !== undefined ? a.infer_ms + ' ms' : '–')
+        + (a.s !== undefined ? '  rtc s=' + a.s + ' d=' + a.d : '')
+        + '  @' + new Date(a.t * 1000).toLocaleTimeString());
+      lines.push('  k     j1     j2     j3     j4     j5     j6     j7  |  grip');
+      (a.values || []).forEach((row, k) => {
+        lines.push(' ' + String(k).padStart(2) + '  ' + row.slice(0, 7).map(fmt).join(' ')
+          + '  | ' + fmt(row[7]));
+      });
+      lines.push('');
+    }
+    document.getElementById('actionsBox').textContent = lines.join('\\n');
+    const last = _actChunks[_actChunks.length - 1];
+    document.getElementById('actionsHint').textContent =
+      'chunk size ' + last.shape[0] + ' × ' + (last.shape[1] || 8) + ' · ' + _actSeq + ' inferences · 显示最近 3 个';
+  } catch (e) { /* keep last render */ }
+}
+setInterval(actionsPoll, 700);
 setInterval(() => { refresh(); ckptRefresh(); logsPoll(); }, 1500);
 </script>
 </body></html>
@@ -2932,6 +2992,16 @@ def build_app(rs: RS, cams: CamManager, runner: EvalRunner,
     @app.post("/ckpt/stop")
     def ckpt_stop():
         return jsonify({"ok": True, "msg": serve.stop()})
+
+    @app.get("/actions")
+    def get_actions():
+        """Raw policy chunks since ?since=<seq> (newest last, at most 8)."""
+        try:
+            since = int(request.args.get("since") or 0)
+        except ValueError:
+            since = 0
+        items = [x for x in list(runner.action_log) if x["seq"] > since]
+        return jsonify({"seq": runner._action_seq, "items": items[-8:]})  # noqa: SLF001
 
     @app.get("/logs")
     def get_logs():
