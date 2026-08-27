@@ -209,6 +209,27 @@ class HomeStore:
 
 _log = logging.getLogger("dashboard")
 
+# start_openpi.sh re-execs the dashboard under sudo (cameras + uinput), so
+# everything it writes is root-owned and the desktop user cannot delete or
+# move it from WinSCP / a plain shell. Hand new files to the invoking user.
+_OWNER_UID = int(os.environ.get("SUDO_UID") or -1)
+_OWNER_GID = int(os.environ.get("SUDO_GID") or -1)
+
+
+def _hand_to_owner(*paths, recursive: bool = True) -> None:
+    """chown path(s) to the sudo-invoking user; no-op when not running as root."""
+    if _OWNER_UID < 0 or os.geteuid() != 0:
+        return
+    for p in paths:
+        try:
+            p = pathlib.Path(p)
+            os.chown(p, _OWNER_UID, _OWNER_GID)
+            if recursive and p.is_dir():
+                for q in p.rglob("*"):
+                    os.chown(q, _OWNER_UID, _OWNER_GID)
+        except Exception as exc:  # noqa: BLE001 — ownership is a convenience
+            _log.debug(f"chown {p}: {exc}")
+
 
 # ─────────────────────────────────────────────────────────────────────
 # Camera manager (acquire/release ZEDs on demand)
@@ -1650,6 +1671,8 @@ class EvalRecorder:
                       self.task_id, self.ep_id, self.frames, meta["steps"])
         except Exception as exc:
             _log.warning(f"episode meta write failed: {exc}")
+        _hand_to_owner(self.out_dir.parent, recursive=False)
+        _hand_to_owner(self.out_dir)
 
 
 INDEX_HTML = """<!doctype html>
@@ -3543,6 +3566,8 @@ def build_app(rs: RS, cams: CamManager, runner: EvalRunner,
             json.dumps(m, ensure_ascii=False, indent=2), encoding="utf-8")
         saved.append(f"{stem}.json")
         _write_meta(meta_f, m)
+        _hand_to_owner(out_dir, recursive=False)
+        _hand_to_owner(*_demo_files(out_dir, stem), recursive=False)
         return {"dir": str(out_dir), "stem": stem, "files": saved,
                 "path": str(out_dir / f"{stem}.mp4"),
                 "msg": f"saved → {out_dir.name}/{stem}.mp4 (+{len(saved) - 1} sidecars)"}
@@ -3599,6 +3624,8 @@ def build_app(rs: RS, cams: CamManager, runner: EvalRunner,
                 q = out_dir / f"layout_{lay_id}.{view}.jpg"
                 q.write_bytes(buf)
                 saved.append(q.name)
+        _hand_to_owner(out_dir, recursive=False)
+        _hand_to_owner(*[out_dir / n for n in saved], recursive=False)
         return jsonify({"ok": True, "path": str(out_dir),
                         "msg": f"saved → {out_dir} ({', '.join(saved)})"})
 
