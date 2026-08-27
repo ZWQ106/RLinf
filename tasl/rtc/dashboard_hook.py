@@ -91,12 +91,14 @@ def capture_obs(runner, prompt: str, wait_s: float = 1.0,
     wrist_r = runner.preprocess_image(wrist_rgb)
     state = runner._droid.get_robot_state()            # noqa: SLF001
     joint_position = np.asarray(state["joint_positions"], dtype=np.float32)
+    ts_ns = (int(state["timestamp_seconds"]) * 1_000_000_000
+             + int(state["timestamp_nanos"]))
+    runner.motion.note_q(joint_position, ts_ns)   # live motion chip
     if meta is not None:
         # Side channel for the watchdog / traj log — NOT part of the obs sent
         # to the policy: raw (unrounded) joints + polymetis state timestamp.
         meta["q_raw"] = joint_position.copy()
-        meta["ts_ns"] = (int(state["timestamp_seconds"]) * 1_000_000_000
-                         + int(state["timestamp_nanos"]))
+        meta["ts_ns"] = ts_ns
     # DROID gripper_position is already in [0,1] with 1=close (pi05_droid convention).
     gripper_position = np.asarray([state["gripper_position"]], dtype=np.float32)
     obs = {
@@ -150,6 +152,7 @@ def run_episode(runner, prompt: str, policy) -> None:
             last_grip[0] = max(0.0, min(1.0, a8[7]))
             runner._last_grip_raw = float(a[7])  # noqa: SLF001
             runner._last_dq_max = float(np.max(np.abs(a8[:7])) * runner.delta_scale)  # noqa: SLF001
+        runner.motion.note_cmd(a8[:7] * runner.delta_scale)   # live motion chip
         droid.update_joint_velocity(a8, blocking=False)
 
     # Last observation fed to the policy — logged with each inference so the
@@ -222,9 +225,9 @@ def _write_sidecar(path: Optional[pathlib.Path], update: dict) -> None:
     if path is None:
         return
     try:
-        data = json.loads(path.read_text()) if path.exists() else {}
+        data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
         data.update(update)
-        path.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception as exc:
         _log.warning(f"rtc sidecar write failed: {exc}")
 

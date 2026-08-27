@@ -181,7 +181,7 @@ class HomeStore:
         self.q = list(default_q)
         self._lock = threading.Lock()
         try:
-            data = json.loads(HOME_STORE_PATH.read_text())
+            data = json.loads(HOME_STORE_PATH.read_text(encoding="utf-8"))
             jq = data.get("joint_q")
             if isinstance(jq, list) and len(jq) == 7:
                 self.q = [float(x) for x in jq]
@@ -197,8 +197,7 @@ class HomeStore:
             try:
                 HOME_STORE_PATH.write_text(
                     json.dumps({"joint_q": self.q,
-                                "saved_at": time.time()}, indent=2)
-                )
+                                "saved_at": time.time()}, indent=2), encoding="utf-8")
                 _log.info(f"home_store saved: {self.q}")
             except Exception as e:
                 _log.error(f"home_store save failed: {e}")
@@ -356,6 +355,101 @@ class CamManager:
 # ─────────────────────────────────────────────────────────────────────
 # Openpi policy runner (in-thread WS inference loop)
 # ─────────────────────────────────────────────────────────────────────
+class MotionMonitor:
+    """Live answer to "is the arm executing the policy?" — the question the
+    30-step watchdog only answers after the fact. Shown as the `motion` chip.
+
+    Every executed tick reports its commanded joint delta (note_cmd); every
+    state read reports the RAW joints + polymetis timestamp (note_q). The
+    verdict looks at the last WINDOW_S seconds:
+
+      policy_idle    net commanded displacement < CMD_MIN — the policy is not
+                     asking for motion (hover / ~zero actions); a still arm is
+                     the policy's choice, not a fault.
+      executing      command present, joint readings changed, timestamp alive.
+      suspect        command present but every joint reading in the window is
+                     bit-identical (raw float32) — ticks may be dropped; shown
+                     with a running duration, the 30-step watchdog escalates.
+      not_executing  the robot-state timestamp stopped advancing — polymetis
+                     control loop down; definitive, no ambiguity with hover.
+
+    Calibration (2026-08-25/26 sync episodes, 1.3 s windows): net command is
+    > 0.17 rad in 90 % of live windows, yet the arm follows only ~10 % of it
+    under DROID's cartesian impedance — so a displacement RATIO cannot tell
+    "slow tracking" from "frozen". What separates them is "changed at all" vs
+    "bit-identical": frozen windows read exactly 0.0, live ones < 1e-4 in 2 %.
+    """
+    WINDOW_S = 1.5
+    CMD_MIN = 0.03       # rad: net commanded max-joint displacement per window
+    MIN_Q_SAMPLES = 3    # state reads needed before judging identity
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._cmd: collections.deque = collections.deque()   # (t, dq[7])
+        self._q: collections.deque = collections.deque()     # (t, q[7], ts_ns)
+        self._still_since: Optional[float] = None
+
+    def reset(self) -> None:
+        with self._lock:
+            self._cmd.clear()
+            self._q.clear()
+            self._still_since = None
+
+    def note_cmd(self, dq) -> None:
+        with self._lock:
+            self._cmd.append((time.time(), np.asarray(dq, dtype=np.float64)[:7].copy()))
+
+    def note_q(self, q, ts_ns: Optional[int] = None) -> None:
+        with self._lock:
+            self._q.append((time.time(), np.asarray(q, dtype=np.float64)[:7].copy(), ts_ns))
+
+    def _prune(self, now: float) -> None:
+        cut = now - self.WINDOW_S
+        while self._cmd and self._cmd[0][0] < cut:
+            self._cmd.popleft()
+        # Keep one sample from before the window as the displacement reference.
+        while len(self._q) > 1 and self._q[1][0] < cut:
+            self._q.popleft()
+
+    def verdict(self, running: bool) -> dict:
+        now = time.time()
+        with self._lock:
+            self._prune(now)
+            cmds = list(self._cmd)
+            qs = list(self._q)
+        out = {"state": "idle", "cmd_net": 0.0, "act_net": 0.0, "n_q": len(qs),
+               "ts_alive": None, "still_s": 0.0, "window_s": self.WINDOW_S}
+        if not running:
+            self._still_since = None
+            return out
+        cmd_net = float(np.abs(sum((d for _, d in cmds), np.zeros(7))).max()) if cmds else 0.0
+        out["cmd_net"] = round(cmd_net, 4)
+        if len(qs) >= 2:
+            out["act_net"] = round(float(np.abs(qs[-1][1] - qs[0][1]).max()), 5)
+            ts = [s[2] for s in qs if s[2] is not None]
+            if len(ts) >= 2:
+                out["ts_alive"] = len(set(ts)) > 1
+        if len(qs) < self.MIN_Q_SAMPLES:
+            out["state"] = "warming"
+            return out
+        identical = all(np.array_equal(s[1], qs[0][1]) for s in qs[1:])
+        if out["ts_alive"] is False:
+            state = "not_executing"
+        elif cmd_net < self.CMD_MIN:
+            state = "policy_idle"
+        elif identical:
+            state = "suspect"
+        else:
+            state = "executing"
+        if state in ("suspect", "not_executing"):
+            self._still_since = self._still_since or now
+            out["still_s"] = round(now - self._still_since, 1)
+        else:
+            self._still_since = None
+        out["state"] = state
+        return out
+
+
 class EvalRunner:
     """In-process openpi pi05_droid inference loop.
 
@@ -454,6 +548,8 @@ class EvalRunner:
         self._wd_ts_armed = False                 # timestamp seen advancing this episode
         self._wd_ts_first_t = 0.0                 # wall clock when the stale run began
         self._wd_last: dict = {}                  # telemetry for /status
+        # Live executing / policy-idle / not-executing verdict (motion chip).
+        self.motion = MotionMonitor()
 
     # Frozen-arm watchdog — "NUC not executing" vs "policy chose not to move".
     # Two rules, evaluated on every policy step:
@@ -481,6 +577,11 @@ class EvalRunner:
     WD_CMD_MIN = 0.02      # mean |clipped action| that counts as "commanding motion"
     WD_Q_EPS = 5e-5        # rad: joints considered frozen (identical readings) below this
     WD_TS_POLLS = 5        # consecutive polls returning the same robot timestamp
+    # A libfranka reflex (communication_constraints_violation — NUC drops FCI
+    # packets, measured 2026-08-26) freezes the state for ~1.05 s while
+    # polymetis runs automaticErrorRecovery, then the loop resumes by itself;
+    # several per episode. Only a loop that stays dead is worth aborting for.
+    WD_TS_STALE_S = 3.0    # seconds the timestamp must stay frozen before aborting
     WD_REMEDY = ("NUC polymetis control loop is not executing commands (libfranka reflex → "
                  "auto-recovery). Watch the robot row: if 'loop' turns alive again within "
                  "~10 s, just Go home + Start; if it stays STALE, press 🔧 Reset NUC.")
@@ -519,10 +620,11 @@ class EvalRunner:
             "cmd_mean": round(cmd_mean, 4), "ts_armed": self._wd_ts_armed,
             "ts_same": self._wd_ts_same, "ts_stale_s": round(stale_s, 2),
         }
-        if self._wd_ts_armed and self._wd_ts_same >= self.WD_TS_POLLS:
+        if self._wd_ts_armed and self._wd_ts_same >= self.WD_TS_POLLS \
+                and stale_s >= self.WD_TS_STALE_S:
             self._wd_reset()
             return (f"NUC not executing commands: robot-state timestamp frozen for "
-                    f"{self.WD_TS_POLLS} polls (~{stale_s:.1f}s) — " + self.WD_REMEDY)
+                    f"{stale_s:.1f}s ({self._wd_ts_same} polls) — " + self.WD_REMEDY)
         if len(self._wd_hist) >= self.WD_STEPS and cmd_mean > self.WD_CMD_MIN \
                 and q_spread < self.WD_Q_EPS:
             self._wd_reset()
@@ -537,6 +639,7 @@ class EvalRunner:
             if self.homing:
                 return "homing in progress — wait for the arm to reach home, then Start"
             self._wd_reset()
+            self.motion.reset()
             self._tag = tag
             # Bootstrap the droid_nuc container — first call spawns the
             # polymetis driver + Robotiq driver inside the container; no-op
@@ -626,6 +729,7 @@ class EvalRunner:
             "gripper_latched": self._latched_close,
             "homing": self.homing,
             "wd": self._wd_last,
+            "motion": self.motion.verdict(self._running),
             "rtc": _rtc_hook.status(self),
             "log_tail": [],  # placeholder for build_app compatibility
         }
@@ -728,6 +832,7 @@ class EvalRunner:
                 # liveness signal (frozen ⇒ the NUC is not executing).
                 state_ts_ns = (int(state["timestamp_seconds"]) * 1_000_000_000
                                + int(state["timestamp_nanos"]))
+                self.motion.note_q(joint_position, state_ts_ns)
                 # DROID's gripper_position is already in [0,1] with 1=close
                 # — same convention pi05_droid was trained against in the
                 # DROID dataset, so pass through verbatim (no flip).
@@ -821,6 +926,7 @@ class EvalRunner:
                             break
                         a8 = np.zeros(8)
                         a8[:7] = clipped[step]              # joint vel in [-1, 1]
+                        self.motion.note_cmd(clipped[step] * self.delta_scale)
                         a8[7] = float(actions[step, 7])     # gripper 0=open, 1=close
                         self._droid.update_joint_velocity(a8, blocking=False)
                         time.sleep(chunk_dt)
@@ -1015,7 +1121,7 @@ class EvalRunner:
             if len(self._audit_ring) > 40:
                 self._audit_ring.pop(0)
             try:
-                with self.audit_path.open("a") as f:
+                with self.audit_path.open("a", encoding="utf-8") as f:
                     f.write(line + "\n")
             except Exception:
                 pass
@@ -1142,7 +1248,7 @@ def discover_checkpoints() -> list[dict]:
         for cfg_f in (g / "config.txt", root / f"{g.name}.config.txt"):
             if cfg_f.exists():
                 try:
-                    cfg = cfg_f.read_text().strip().splitlines()[0].strip() or cfg
+                    cfg = cfg_f.read_text(encoding="utf-8").strip().splitlines()[0].strip() or cfg
                 except Exception:
                     pass
                 break
@@ -1337,7 +1443,7 @@ class ServeManager:
     def status(self) -> dict:
         log_tail = []
         try:
-            text = pathlib.Path(SERVE_LOG).read_text()
+            text = pathlib.Path(SERVE_LOG).read_text(encoding="utf-8")
             log_tail = text[-1500:].splitlines()[-8:]
         except OSError:
             pass
@@ -1469,7 +1575,7 @@ class EvalRecorder:
                 return
             try:
                 if self._traj_f is None:
-                    self._traj_f = (self.out_dir / "traj.jsonl").open("a")
+                    self._traj_f = (self.out_dir / "traj.jsonl").open("a", encoding="utf-8")
                 self._traj_f.write(line + "\n")
                 self.steps_logged += 1
             except Exception as exc:
@@ -1494,7 +1600,7 @@ class EvalRecorder:
                 self._traj_f = None
             try:
                 (self.out_dir / "frame_times.json").write_text(
-                    json.dumps([round(t, 4) for t in self._frame_ts]))
+                    json.dumps([round(t, 4) for t in self._frame_ts]), encoding="utf-8")
             except Exception as exc:
                 _log.warning(f"frame_times write failed: {exc}")
         meta = {
@@ -1518,7 +1624,7 @@ class EvalRecorder:
         }
         try:
             (self.out_dir / "meta.json").write_text(
-                json.dumps(meta, ensure_ascii=False, indent=2))
+                json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
             _log.info("episode recorded: %s/%s (%d frames, %d steps)",
                       self.task_id, self.ep_id, self.frames, meta["steps"])
         except Exception as exc:
@@ -1671,6 +1777,7 @@ INDEX_HTML = """<!doctype html>
     <span class="chip" id="chip-cams"><span class="dot"></span>cams</span>
     <span class="chip" id="chip-eval"><span class="dot"></span>eval</span>
     <span class="chip" id="chip-ckpt"><span class="dot"></span>policy</span>
+    <span class="chip" id="chip-motion" title="policy 静止 / 执行中 / 有指令但机械臂没动 — 最近 1.5 s 的下发位移 vs 关节实际位移 + polymetis 时间戳"><span class="dot"></span><span id="chip-motion-txt">motion</span></span>
   </div>
 </header>
 
@@ -2352,6 +2459,23 @@ async function refresh() {
     setChip('chip-gripper', j.gripper_ok ? 'ok' : 'bad');
     setChip('chip-cams', j.cam_running ? 'ok' : 'bad');
     setChip('chip-eval', re.running ? 'busy' : 'ok');
+    // motion chip: policy idle vs executing vs commanded-but-not-moving.
+    const mo = re.motion || {};
+    const fmtN = (x) => (x === null || x === undefined) ? '-' : Number(x).toFixed(4);
+    const moMap = {
+      executing:     ['ok',   '🟢 执行中'],
+      policy_idle:   ['',     '🟡 policy 静止'],
+      suspect:       ['busy', '🟠 有指令未动 ' + (mo.still_s || 0) + 's'],
+      not_executing: ['bad',  '🔴 NUC 未执行 ' + (mo.still_s || 0) + 's' + ((mo.still_s || 0) < 3 ? ' (reflex 自恢复中)' : '')],
+      warming:       ['',     '… 采样中'],
+      idle:          ['',     'motion'],
+    };
+    const mm = moMap[mo.state] || moMap.idle;
+    setChip('chip-motion', mm[0]);
+    document.getElementById('chip-motion-txt').textContent = mm[1];
+    const moDetail = 'cmd_net=' + fmtN(mo.cmd_net) + ' rad → act_net=' + fmtN(mo.act_net)
+      + ' rad / ' + (mo.window_s || 1.5) + 's · ts=' + (mo.ts_alive === false ? 'STALE' : (mo.ts_alive ? 'alive' : '-'));
+    document.getElementById('chip-motion').title = moDetail;
     // episode lifecycle events
     if (lastEvalRunning === false && re.running === true) {
       consoleLine('eval episode started — prompt: ' + (re.last_prompt || '-'), 'lvl-I');
@@ -2396,6 +2520,7 @@ async function refresh() {
            +  '<br>last infer ms=' + (re.last_infer_ms ? re.last_infer_ms.toFixed(0) : '-')
            +  '<br>last grip cmd(raw,0=open 1=close)=' + fmt(re.last_grip_raw)
            +  '<br>last |dq| max=' + fmt(re.last_dq_max)
+           +  '<br>motion: ' + mm[1] + ' <span style="color:var(--faint)">(' + moDetail + ')</span>'
            +  '<br>wd: q_spread=' + fmt(re.wd && re.wd.q_spread) + ' cmd=' + fmt(re.wd && re.wd.cmd_mean)
            +  ' ts=' + (re.wd && re.wd.ts_same > 1
                         ? '<span style="color:var(--err)">STALE×' + re.wd.ts_same + '</span>'
@@ -2814,7 +2939,7 @@ def build_app(rs: RS, cams: CamManager, runner: EvalRunner,
         dashboard's own log records + a tail of the serve_policy log."""
         serve_tail = []
         try:
-            text = pathlib.Path(SERVE_LOG).read_text()
+            text = pathlib.Path(SERVE_LOG).read_text(encoding="utf-8")
             serve_tail = text[-1500:].splitlines()[-6:]
         except OSError:
             pass
@@ -2992,7 +3117,7 @@ def build_app(rs: RS, cams: CamManager, runner: EvalRunner,
             return jsonify({"ok": False, "msg": f"episode.json: {e}"}), 500
         meta["success"] = success
         meta["success_marked_at"] = time.time()
-        with open(ep_json, "w") as fh:
+        with open(ep_json, "w", encoding="utf-8") as fh:
             json.dump(meta, fh, indent=2)
         _log.info(f"marked {runs[-1]}/{eps[-1]} success={success}")
         return jsonify({"ok": True, "run": runs[-1], "episode": eps[-1],
@@ -3288,7 +3413,7 @@ def build_app(rs: RS, cams: CamManager, runner: EvalRunner,
             metas = []
             for meta_f in root.rglob("meta.json"):
                 try:
-                    m = json.loads(meta_f.read_text())
+                    m = json.loads(meta_f.read_text(encoding="utf-8"))
                 except Exception:
                     continue
                 metas.append((m.get("start_time", ""), meta_f, m))
@@ -3308,7 +3433,7 @@ def build_app(rs: RS, cams: CamManager, runner: EvalRunner,
         dst = out_dir / f"{ep}.mp4"
         shutil.copy2(src, dst)
         (out_dir / f"{ep}.json").write_text(
-            json.dumps(m, ensure_ascii=False, indent=2))
+            json.dumps(m, ensure_ascii=False, indent=2), encoding="utf-8")
         saved = [dst.name, f"{ep}.json"]
         # Sidecars for the later video+curves render: per-step trajectory
         # and per-frame timestamps. Older episodes may lack them.
@@ -3337,7 +3462,7 @@ def build_app(rs: RS, cams: CamManager, runner: EvalRunner,
         out_dir.mkdir(parents=True, exist_ok=True)
         saved = []
         p = out_dir / f"layout_{lay_id}.json"
-        p.write_text(json.dumps(lay, ensure_ascii=False, indent=2))
+        p.write_text(json.dumps(lay, ensure_ascii=False, indent=2), encoding="utf-8")
         saved.append(p.name)
         for view in ("exterior", "wrist"):
             buf = task_layout_store.snapshot_bytes(lay_id, view)
@@ -3406,7 +3531,7 @@ def build_app(rs: RS, cams: CamManager, runner: EvalRunner,
             return None
         for meta_f in root.rglob("meta.json"):
             try:
-                m = json.loads(meta_f.read_text())
+                m = json.loads(meta_f.read_text(encoding="utf-8"))
             except Exception:
                 continue
             if m.get("ep_id") == ep_id:
@@ -3426,7 +3551,7 @@ def build_app(rs: RS, cams: CamManager, runner: EvalRunner,
         if root.exists():
             for meta_f in root.rglob("meta.json"):
                 try:
-                    m = json.loads(meta_f.read_text())
+                    m = json.loads(meta_f.read_text(encoding="utf-8"))
                 except Exception:
                     continue
                 # Episodes started without a task (or before the task
@@ -3467,7 +3592,7 @@ def build_app(rs: RS, cams: CamManager, runner: EvalRunner,
         for k in ("mark", "note", "task", "ckpt", "prompt"):
             if k in body and body[k] is not None:
                 meta[k] = body[k]
-        meta_f.write_text(json.dumps(meta, ensure_ascii=False, indent=2))
+        meta_f.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
         return jsonify({"ok": True, "msg": "updated"})
 
     @app.post("/episode/delete")
@@ -3627,7 +3752,7 @@ def build_app(rs: RS, cams: CamManager, runner: EvalRunner,
                 return jsonify({"ok": False, "msg": "no eval episode to mark"}), 404
             meta_f = hit
         try:
-            meta = json.loads(meta_f.read_text())
+            meta = json.loads(meta_f.read_text(encoding="utf-8"))
             if meta.get("abort") and not body.get("force"):
                 # Watchdog/error-aborted episode: the NUC dropped the ticks (or
                 # the loop died), so the verdict says nothing about the policy
@@ -3635,7 +3760,7 @@ def build_app(rs: RS, cams: CamManager, runner: EvalRunner,
                 # filter on those). {"force": true} overrides.
                 mark = "aborted"
             meta["mark"] = mark
-            meta_f.write_text(json.dumps(meta, ensure_ascii=False, indent=2))
+            meta_f.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception as e:
             return jsonify({"ok": False, "msg": f"mark write failed: {e}"}), 500
         ep_id = meta.get("ep_id") or meta_f.parent.name

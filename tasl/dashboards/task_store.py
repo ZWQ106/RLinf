@@ -77,7 +77,7 @@ def _discover_dataset_tasks() -> dict:
                 name = f"{parent.name}/{ds_dir.name}"
             try:
                 prompts = [json.loads(l).get("task", "")
-                           for l in f.read_text().splitlines() if l.strip()]
+                           for l in f.read_text(encoding="utf-8").splitlines() if l.strip()]
             except Exception:
                 continue
             prompts = [p for p in prompts if p]
@@ -115,7 +115,7 @@ class TaskStore:
     def _load(self) -> list:
         try:
             if self.path.exists():
-                data = json.loads(self.path.read_text())
+                data = json.loads(self.path.read_text(encoding="utf-8"))
                 self._mtime = self._disk_mtime()
                 if isinstance(data, list):
                     return [_norm_layouts(t) for t in data
@@ -150,7 +150,7 @@ class TaskStore:
 
     def _save(self) -> None:
         tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.tasks, ensure_ascii=False, indent=2))
+        tmp.write_text(json.dumps(self.tasks, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(self.path)
         self._mtime = self._disk_mtime()
 
