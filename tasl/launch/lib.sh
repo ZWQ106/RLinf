@@ -311,6 +311,14 @@ preflight_robot() {
     Then make sure the FR3 is powered and FCI is active in Desk (brakes off,
     execution mode). Re-run this script."
   ok "robot reachable"
+  # Belt and braces for the 2026-08-26 reflex fix (saved_demo/bug/BUGLOG.md §1.6):
+  # pin whatever polymetis driver is already running to P-cores. The dashboard
+  # re-pins after every bootstrap anyway (DroidLikeClient.bootstrap), so a
+  # failure here (driver not spawned yet, ssh key missing) is only a warning.
+  step "NUC: pin polymetis RT threads to P-cores"
+  if [[ -n "$LAUNCH_DRY_RUN" ]]; then echo "DRY: nuc-pin-rt.sh"
+  elif bash "$TASL/launch/nuc-pin-rt.sh" 2>/dev/null | grep -q '^pinned$'; then ok "NUC RT threads pinned"
+  else warn "nuc-pin-rt.sh did not pin (driver not up yet?) — bootstrap will retry"; fi
   step "Mutual exclusion: stop the other dashboard"
   kill_other_dashboard "$me"
   ok "other dashboard stopped"

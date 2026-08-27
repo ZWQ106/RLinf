@@ -16,6 +16,8 @@ container start. Call `bootstrap()` once before sending any motion or state
 read; subsequent calls are no-ops.
 """
 import math
+import os
+import subprocess
 import threading
 import time
 import logging
@@ -107,6 +109,7 @@ class DroidLikeClient:
                     self._client.launch_robot()
                     self._bootstrapped = True
                     _log.info("bootstrap complete")
+                    self._pin_nuc_rt_threads()
                     return
                 except Exception as exc:
                     last_exc = exc
@@ -114,6 +117,25 @@ class DroidLikeClient:
                                  attempt + 1, str(exc)[:120])
                     time.sleep(6.0)
             raise last_exc
+
+    def _pin_nuc_rt_threads(self) -> None:
+        """Pin the freshly spawned polymetis driver to P-cores (bug-1 fix,
+        saved_demo/bug/BUGLOG.md §1.6–1.7). launch_controller respawns the
+        driver on every bootstrap, so the pins must be re-applied here.
+        Best-effort: a failure is logged, never raised."""
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "..", "launch", "nuc-pin-rt.sh")
+        try:
+            r = subprocess.run(["bash", script], capture_output=True, text=True,
+                               timeout=30, encoding="utf-8", errors="replace")
+            tail = (r.stdout.strip().splitlines() or [""])[-1]
+            if r.returncode == 0 and tail == "pinned":
+                _log.info("NUC RT threads pinned to P-cores (nuc-pin-rt.sh)")
+            else:
+                _log.warning("nuc-pin-rt.sh rc=%d: %s %s", r.returncode,
+                             r.stdout.strip()[-200:], r.stderr.strip()[-200:])
+        except Exception as exc:  # noqa: BLE001 — never block bootstrap
+            _log.warning("nuc-pin-rt.sh failed: %s", exc)
 
     def close(self) -> None:
         for c in (self._client, self._fast):
@@ -246,7 +268,10 @@ class DroidLikeClient:
         residual = float(np.max(np.abs(target - q1)))
         moved = float(np.max(np.abs(q1 - q0)))
         _log.info("stream_to_joint_position: done, moved=%.3f residual=%.3f rad", moved, residual)
-        if verify and disp > 0.03 and moved < 0.5 * disp:
+        # Below ~0.1 rad the cartesian-impedance steady-state error (~0.03 rad)
+        # dominates and the arm legitimately "moves 0.003 of 0.034" — only a
+        # non-trivial displacement can prove the controller is dead.
+        if verify and disp > 0.1 and moved < 0.5 * disp:
             raise ControllerNotResponding(
                 f"arm did not follow streamed setpoints (moved {moved:.3f} of {disp:.3f} rad) — "
                 "NUC polymetis controller is not executing commands; run "
