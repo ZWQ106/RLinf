@@ -1896,16 +1896,18 @@ INDEX_HTML = """<!doctype html>
     </div>
     <div class="flexbar">
       <button id="btnSaveVideo" onclick="saveVideo()" disabled
-              title="Stop / Mark 之后可保存,下次 Start 前有效 — 视频(exterior|wrist)+meta+traj → saved_demo/<task>/">💾 Save demo</button>
+              title="手动导出最新一条录制(Mark ✓/✗ 已经自动导出)— 视频(exterior|wrist)+meta+traj → saved_demo/<task>[-ood]/<layout>_rNN.*">💾 Save demo</button>
       <button onclick="saveLayout()"
               title="导出当前选中 layout 的参考图(exterior/wrist jpg + json)→ saved_demo/<task>/">🖼 Save png</button>
       <button onclick="saveOodLayout()"
               title="把当前相机画面拍成该任务的 OOD layout(<task>-OODn),挂到任务上并作为 ghost;之后的 episode meta 记录该 layout">🌀 Save as OOD layout</button>
       <span id="saveInfo" style="font-size:12px;color:var(--faint)"></span>
     </div>
-    <div class="hint">Start 前先在上方选择任务;Mark 写入最新一条 eval 录制的
-      meta。Save demo 导出最新一条录制(HD720 双视角)、Save png 导出当前选中
-      layout 的参考图,都存到 RLinf/saved_demo/&lt;task&gt;/。Save as OOD layout
+    <div class="hint">Start 前先在上方选择任务;Mark ✓/✗ 写入最新一条 eval 录制的
+      meta 并<b>自动导出</b>视频到 RLinf/saved_demo/&lt;task&gt;[-ood]/&lt;layout&gt;_rNN.*
+      (layout 名含 ood 时进 -ood 目录;NN = 该 layout 的第几条 rollout;Stop 不导出,
+      aborted 不导出)。Save demo 手动导出最新一条;Save png 导出当前选中
+      layout 的参考图到 saved_demo/&lt;task&gt;/。Save as OOD layout
       把当前桌面拍成 &lt;task&gt;-OODn 蒙版并挂到任务上(OOD eval 可复现)。
       Commit grasp = 停策略 → 夹爪闭合 → 上提 5cm(force_open 调试用)</div>
     <span id="evalMarkInfo" style="font-size:12px;color:var(--faint)"></span>
@@ -2245,6 +2247,9 @@ async function evalMark(mark) {
         + (j.stopped ? ' · stopped' : '') + ' · ' + (j.home || '');
       if (j.mark === 'aborted') toast('⚠ episode was aborted by the watchdog → marked "aborted", not ' + mark, 'err');
       if (j.home && j.home !== 'homed') toast('⌂ ' + j.home, 'err');
+      const si = document.getElementById('saveInfo');
+      if (j.demo && j.demo.error) { si.textContent = '✗ demo: ' + j.demo.error; toast('✗ demo save failed: ' + j.demo.error, 'err'); }
+      else if (j.demo) { si.textContent = '💾 ' + j.demo.msg; }
       setSaveVideo(true);
       epRefresh();
     } else {
@@ -2767,7 +2772,9 @@ async function epRefresh() {
           ? ' <span title="task 由 prompt 自动匹配" style="color:var(--faint)">(auto)</span>' : '';
         return '<tr>'
           + '<td><button class="tiny" data-ep="' + esc(e.ep_id) + '" onclick="playEpId(this.dataset.ep)">▶</button></td>'
-          + '<td>' + esc(e.start_time) + auto + '</td>'
+          + '<td>' + esc(e.start_time) + auto
+          + (e.demo && e.demo.stem ? '<br><span style="color:var(--faint)" title="saved_demo/' + esc(e.demo.dir.split('/').pop()) + '">💾 ' + esc(e.demo.stem) + '</span>' : '')
+          + '</td>'
           + '<td>' + esc(e.ckpt || '-')
           + (e.layout ? '<br><span style="color:var(--faint)" title="layout">' + esc(e.layout) + '</span>' : '')
           + '</td>'
@@ -3471,10 +3478,70 @@ def build_app(rs: RS, cams: CamManager, runner: EvalRunner,
         return Response(buf, mimetype="image/jpeg")
 
     # ── Demo exports → RLinf/saved_demo/<task>/ ──────────────────────
+    # ── Demo exports → RLinf/saved_demo/<task>[-ood]/<layout>_rNN.* ───────
+    # Naming: directory <task>-ood when the layout id contains "ood", else
+    # <task>; stem = <layout id>_r<NN> (the task id when the episode ran
+    # without a layout), NN = rollout number counted per layout id. The
+    # episode's meta.json remembers {"demo": {"dir", "stem"}} so delete /
+    # re-mark / compact can find the export again.
+    _DEMO_SIDE = (("video.mp4", ".mp4"), ("traj.jsonl", ".traj.jsonl"),
+                  ("frame_times.json", ".frames.json"))
+
+    def _demo_target(m: dict):
+        task = (m.get("task") or "untagged").strip()
+        lay = (m.get("layout") or "").strip()
+        sub = f"{task}-ood" if "ood" in lay.lower() else task
+        return pathlib.Path(DEMO_DIR) / sub, (lay or task)
+
+    def _demo_rollout_no(out_dir: pathlib.Path, base: str) -> int:
+        pat = re.compile(rf"^{re.escape(base)}_r(\d+)$")
+        n = 0
+        for j in out_dir.glob(f"{base}_r*.json"):
+            mm = pat.match(j.stem)
+            if mm:
+                n = max(n, int(mm.group(1)))
+        return n + 1
+
+    def _demo_files(out_dir: pathlib.Path, stem: str):
+        return [out_dir / f"{stem}{suf}" for _n, suf in _DEMO_SIDE] + [out_dir / f"{stem}.json"]
+
+    def _write_meta(meta_f: pathlib.Path, m: dict) -> None:
+        meta_f.write_text(json.dumps(m, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _export_episode(meta_f: pathlib.Path, m: dict) -> dict:
+        """Copy video + sidecars + meta of one episode into saved_demo with the
+        <layout>_rNN naming; re-exporting an already exported episode keeps
+        its number. Raises FileNotFoundError when the episode has no video."""
+        src = meta_f.parent / "video.mp4"
+        if not src.exists():
+            raise FileNotFoundError(f"{m.get('ep_id')} 没有 video.mp4")
+        out_dir, base = _demo_target(m)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        prev = m.get("demo") or {}
+        if (prev.get("dir") == str(out_dir) and prev.get("stem")
+                and (out_dir / f"{prev['stem']}.json").exists()):
+            stem = prev["stem"]
+        else:
+            stem = f"{base}_r{_demo_rollout_no(out_dir, base):02d}"
+        saved = []
+        for name, suf in _DEMO_SIDE:
+            side = meta_f.parent / name
+            if side.exists():
+                shutil.copy2(side, out_dir / f"{stem}{suf}")
+                saved.append(f"{stem}{suf}")
+        m["demo"] = {"dir": str(out_dir), "stem": stem}
+        (out_dir / f"{stem}.json").write_text(
+            json.dumps(m, ensure_ascii=False, indent=2), encoding="utf-8")
+        saved.append(f"{stem}.json")
+        _write_meta(meta_f, m)
+        return {"dir": str(out_dir), "stem": stem, "files": saved,
+                "path": str(out_dir / f"{stem}.mp4"),
+                "msg": f"saved → {out_dir.name}/{stem}.mp4 (+{len(saved) - 1} sidecars)"}
+
     @app.post("/save_video")
     def save_video():
-        """Export the newest eval recording as a demo → saved_demo/<task>/<ep_id>.*
-        (tiled exterior|wrist MP4 + meta json + traj.jsonl + frame times)."""
+        """Manual export of the newest eval recording (same naming as the
+        automatic export done by Mark ✓/✗)."""
         if runner.status()["running"]:
             return jsonify({"ok": False, "msg": "eval 进行中 — 先 Stop"}), 409
         newest = None
@@ -3493,28 +3560,11 @@ def build_app(rs: RS, cams: CamManager, runner: EvalRunner,
         if newest is None:
             return jsonify({"ok": False, "msg": "还没有 eval 录制"}), 404
         meta_f, m = newest
-        src = meta_f.parent / "video.mp4"
-        if not src.exists():
-            return jsonify({"ok": False,
-                            "msg": f"{m.get('ep_id')} 没有 video.mp4"}), 404
-        out_dir = pathlib.Path(DEMO_DIR) / (m.get("task") or "untagged")
-        out_dir.mkdir(parents=True, exist_ok=True)
-        ep = m.get("ep_id", "episode")
-        dst = out_dir / f"{ep}.mp4"
-        shutil.copy2(src, dst)
-        (out_dir / f"{ep}.json").write_text(
-            json.dumps(m, ensure_ascii=False, indent=2), encoding="utf-8")
-        saved = [dst.name, f"{ep}.json"]
-        # Sidecars for the later video+curves render: per-step trajectory
-        # and per-frame timestamps. Older episodes may lack them.
-        for name, suffix in (("traj.jsonl", ".traj.jsonl"),
-                             ("frame_times.json", ".frames.json")):
-            side = meta_f.parent / name
-            if side.exists():
-                shutil.copy2(side, out_dir / f"{ep}{suffix}")
-                saved.append(f"{ep}{suffix}")
-        return jsonify({"ok": True, "path": str(dst), "files": saved,
-                        "msg": f"saved {ep} → {out_dir}/ ({', '.join(saved)})"})
+        try:
+            r = _export_episode(meta_f, m)
+        except FileNotFoundError as e:
+            return jsonify({"ok": False, "msg": str(e)}), 404
+        return jsonify({"ok": True, **r})
 
     @app.post("/save_layout")
     def save_layout():
@@ -3663,6 +3713,11 @@ def build_app(rs: RS, cams: CamManager, runner: EvalRunner,
             if k in body and body[k] is not None:
                 meta[k] = body[k]
         meta_f.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        demo = meta.get("demo") or {}
+        if demo.get("dir") and demo.get("stem"):
+            jf = pathlib.Path(demo["dir"]) / f"{demo['stem']}.json"
+            if jf.exists():
+                jf.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
         return jsonify({"ok": True, "msg": "updated"})
 
     @app.post("/episode/delete")
@@ -3835,6 +3890,16 @@ def build_app(rs: RS, cams: CamManager, runner: EvalRunner,
             return jsonify({"ok": False, "msg": f"mark write failed: {e}"}), 500
         ep_id = meta.get("ep_id") or meta_f.parent.name
         _log.info(f"eval mark: {meta.get('task')}/{ep_id} → {mark}")
+        # Auto-export the recording (video + sidecars) for success / fail;
+        # aborted episodes are not counted, so they are not exported either.
+        demo = None
+        if mark in ("success", "fail"):
+            try:
+                demo = _export_episode(meta_f, meta)
+                _log.info(f"demo saved: {demo['dir']}/{demo['stem']}")
+            except Exception as e:  # noqa: BLE001 — the verdict is already on disk
+                demo = {"error": str(e)}
+                _log.warning(f"eval mark: demo save failed: {e}")
         # Let /stop's halt tick land before commanding the home move.
         if was_running:
             time.sleep(0.7)
@@ -3855,7 +3920,8 @@ def build_app(rs: RS, cams: CamManager, runner: EvalRunner,
         finally:
             runner.homing = False
         return jsonify({"ok": True, "ep_id": ep_id, "task": meta.get("task"),
-                        "mark": mark, "stopped": was_running, "home": home_msg})
+                        "mark": mark, "stopped": was_running, "home": home_msg,
+                        "demo": demo})
 
     @app.post("/home")
     def post_home():
