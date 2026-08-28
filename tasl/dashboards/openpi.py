@@ -515,7 +515,7 @@ class EvalRunner:
         # streaming under impedance. We mirror that here.
         self.delta_scale = 0.2
         self.dynamics_factor = 0.3
-        self.max_iterations = 400
+        self.max_iterations = 1200
         self.control_hz = 15.0
         # State
         # Gripper modes (switchable live via /gripper_mode):
@@ -652,8 +652,22 @@ class EvalRunner:
         if len(self._wd_hist) >= self.WD_STEPS and cmd_mean > self.WD_CMD_MIN \
                 and q_spread < self.WD_Q_EPS:
             self._wd_reset()
-            return (f"controller not executing commands: joint readings identical for "
-                    f"{self.WD_STEPS} steps while the policy commanded motion — " + self.WD_REMEDY)
+            msg = (f"joint readings identical for {self.WD_STEPS} steps while the policy "
+                   f"commanded motion (mean |a| {cmd_mean:.3f})")
+            if ts_ns is not None and self._wd_ts_armed:
+                # The 1 kHz loop timestamp is advancing, so the controller IS
+                # executing — the arm is physically blocked (contact, jammed
+                # object) or the deltas are too small to move it. Warn only:
+                # on 2026-08-28 this rule aborted a 531-step T4-a insertion at
+                # contact while the NUC was perfectly healthy. A dead loop is
+                # still caught by rule (1); a DROID command-drop wedge (BUGLOG
+                # §2.3) shows up as the 🟠 suspect chip + Go home moved 0.000.
+                self._wd_last["suspect"] = msg
+                if now - getattr(self, "_wd_suspect_t", 0.0) > 10.0:
+                    self._wd_suspect_t = now
+                    _log.warning("watchdog: " + msg + " — loop alive; arm blocked? continuing")
+                return None
+            return "controller not executing commands: " + msg + " — " + self.WD_REMEDY
         return None
 
     def start(self, prompt: str, tag: Optional[dict] = None) -> str:
@@ -1880,6 +1894,10 @@ INDEX_HTML = """<!doctype html>
     <select id="taskLayoutSel" onchange="taskGhostPick()" style="min-width:160px">
       <option value="">—</option>
     </select>
+    <button class="tiny" onclick="renameTaskLayout()"
+            title="重命名选中的 layout(蒙版文件 + 所有引用它的任务记录一起改;已跑过的 episode / saved_demo 保留旧名)">✏️ 改名</button>
+    <button class="tiny" onclick="deleteTaskLayout()"
+            title="把选中的 layout 从当前任务摘掉;若没有其他任务用它,同时删除蒙版文件(不影响已导出的 saved_demo)">🗑 删 layout</button>
     <label style="margin-left:10px"><input type="checkbox" id="ghostOn" onchange="ghostUpdate()"/> ghost 蒙版</label>
     <input type="range" id="ghostAlpha" min="10" max="90" value="45"
            style="width:90px" oninput="ghostUpdate()"/>
@@ -1919,7 +1937,7 @@ INDEX_HTML = """<!doctype html>
     </div>
     <div class="flexbar">
       <button id="btnSaveVideo" onclick="saveVideo()" disabled
-              title="手动导出最新一条录制(Mark ✓/✗ 已经自动导出)— 视频(exterior|wrist)+meta+traj → saved_demo/<task>[-ood]/<layout>_rNN.*">💾 Save demo</button>
+              title="手动导出最新一条录制(Mark ✓/✗ 已经自动导出)— 视频(exterior|wrist)+meta+traj → saved_demo/<task>[-ood]/<layout>_rNN_T|F.*">💾 Save demo</button>
       <button onclick="saveLayout()"
               title="导出当前选中 layout 的参考图(exterior/wrist jpg + json)→ saved_demo/<task>/">🖼 Save png</button>
       <button onclick="saveOodLayout()"
@@ -1929,7 +1947,7 @@ INDEX_HTML = """<!doctype html>
       <span id="saveInfo" style="font-size:12px;color:var(--faint)"></span>
     </div>
     <div class="hint">Start 前先在上方选择任务;Mark ✓/✗ 写入最新一条 eval 录制的
-      meta 并<b>自动导出</b>视频到 RLinf/saved_demo/&lt;task&gt;[-ood]/&lt;layout&gt;_rNN.*
+      meta 并<b>自动导出</b>视频到 RLinf/saved_demo/&lt;task&gt;[-ood]/&lt;layout&gt;_rNN_T|F.*(T=成功 F=失败)
       (layout 名含 ood 时进 -ood 目录;NN = 该 layout 的第几条 rollout;Stop 不导出,
       aborted 不导出)。Save demo 手动导出最新一条;Save png 导出当前选中
       layout 的参考图到 saved_demo/&lt;task&gt;/。Save as OOD layout
@@ -2677,6 +2695,29 @@ function taskGhostPick() {
   taskGhostLayout = document.getElementById('taskLayoutSel').value || '';
   if (taskGhostLayout) document.getElementById('ghostOn').checked = true;
   ghostUpdate();
+}
+async function renameTaskLayout() {
+  const tid = document.getElementById('taskSel').value;
+  const lay = document.getElementById('taskLayoutSel').value;
+  if (!tid || !lay) { toast('先选择任务和 layout', 'err'); return; }
+  const nu = (prompt('layout ' + lay + ' 改名为:', lay) || '').trim();
+  if (!nu || nu === lay) return;
+  const j = await api('/task_layout/rename', {layout_id: lay, new_id: nu});
+  if (!j.ok) return;
+  await taskRefresh();
+  onTaskSelect();
+  const sel = document.getElementById('taskLayoutSel');
+  if ([...sel.options].some(o => o.value === nu)) { sel.value = nu; taskGhostPick(); }
+}
+async function deleteTaskLayout() {
+  const tid = document.getElementById('taskSel').value;
+  const lay = document.getElementById('taskLayoutSel').value;
+  if (!tid || !lay) { toast('先选择任务和 layout', 'err'); return; }
+  if (!confirm('从任务 ' + tid + ' 删除 layout ' + lay + '?(没有其他任务引用时蒙版文件也会一并删除)')) return;
+  const j = await api('/task_layout/delete', {task_id: tid, layout_id: lay});
+  if (!j.ok) return;
+  await taskRefresh();
+  onTaskSelect();
 }
 function taskNewOpen() {
   document.getElementById('taskForm').style.display = 'block';
@@ -3512,8 +3553,9 @@ def build_app(rs: RS, cams: CamManager, runner: EvalRunner,
     # ── Demo exports → RLinf/saved_demo/<task>/ ──────────────────────
     # ── Demo exports → RLinf/saved_demo/<task>[-ood]/<layout>_rNN.* ───────
     # Naming: directory <task>-ood when the layout id contains "ood", else
-    # <task>; stem = <layout id>_r<NN> (the task id when the episode ran
-    # without a layout), NN = rollout number counted per layout id. The
+    # <task>; stem = <layout id>_r<NN>_<T|F> (the task id when the episode
+    # ran without a layout), NN = rollout number counted per layout id and
+    # T/F = the operator's verdict (success/fail; no suffix if unmarked). The
     # episode's meta.json remembers {"demo": {"dir", "stem"}} so delete /
     # re-mark / compact can find the export again.
     _DEMO_SIDE = (("video.mp4", ".mp4"), ("traj.jsonl", ".traj.jsonl"),
@@ -3525,14 +3567,19 @@ def build_app(rs: RS, cams: CamManager, runner: EvalRunner,
         sub = f"{task}-ood" if "ood" in lay.lower() else task
         return pathlib.Path(DEMO_DIR) / sub, (lay or task)
 
+    _DEMO_MARK_SUFFIX = {"success": "_T", "fail": "_F"}
+
     def _demo_rollout_no(out_dir: pathlib.Path, base: str) -> int:
-        pat = re.compile(rf"^{re.escape(base)}_r(\d+)$")
+        pat = re.compile(rf"^{re.escape(base)}_r(\d+)(?:_[TF])?$")
         n = 0
         for j in out_dir.glob(f"{base}_r*.json"):
             mm = pat.match(j.stem)
             if mm:
                 n = max(n, int(mm.group(1)))
         return n + 1
+
+    def _demo_stem(base: str, n: int, mark: str) -> str:
+        return f"{base}_r{n:02d}{_DEMO_MARK_SUFFIX.get(mark or '', '')}"
 
     def _demo_files(out_dir: pathlib.Path, stem: str):
         return [out_dir / f"{stem}{suf}" for _n, suf in _DEMO_SIDE] + [out_dir / f"{stem}.json"]
@@ -3550,11 +3597,19 @@ def build_app(rs: RS, cams: CamManager, runner: EvalRunner,
         out_dir, base = _demo_target(m)
         out_dir.mkdir(parents=True, exist_ok=True)
         prev = m.get("demo") or {}
-        if (prev.get("dir") == str(out_dir) and prev.get("stem")
+        stem_pat = re.compile(rf"^{re.escape(base)}_r(\d+)(?:_[TF])?$")
+        pm = stem_pat.match(prev.get("stem") or "")
+        if (prev.get("dir") == str(out_dir) and pm
                 and (out_dir / f"{prev['stem']}.json").exists()):
-            stem = prev["stem"]
+            # Re-mark of an exported episode: keep its number, refresh the
+            # T/F suffix (rename the files already there if it changed).
+            stem = _demo_stem(base, int(pm.group(1)), m.get("mark") or "")
+            if stem != prev["stem"]:
+                for f in _demo_files(out_dir, prev["stem"]):
+                    if f.exists():
+                        f.rename(out_dir / (stem + f.name[len(prev["stem"]):]))
         else:
-            stem = f"{base}_r{_demo_rollout_no(out_dir, base):02d}"
+            stem = _demo_stem(base, _demo_rollout_no(out_dir, base), m.get("mark") or "")
         saved = []
         for name, suf in _DEMO_SIDE:
             side = meta_f.parent / name
@@ -3628,6 +3683,53 @@ def build_app(rs: RS, cams: CamManager, runner: EvalRunner,
         _hand_to_owner(*[out_dir / n for n in saved], recursive=False)
         return jsonify({"ok": True, "path": str(out_dir),
                         "msg": f"saved → {out_dir} ({', '.join(saved)})"})
+
+    @app.post("/task_layout/rename")
+    def task_layout_rename():
+        """Rename a layout in the shared layout dir and in every task record
+        that references it. Past episodes / saved_demo keep the old name."""
+        body = request.get_json(silent=True) or {}
+        lay_id = (body.get("layout_id") or "").strip()
+        new_id = (body.get("new_id") or "").strip()
+        if not lay_id or not new_id:
+            return jsonify({"ok": False, "msg": "layout_id and new_id required"}), 400
+        if not task_layout_store.exists(lay_id):
+            return jsonify({"ok": False, "msg": f"layout {lay_id} 没有蒙版文件"}), 404
+        try:
+            task_layout_store.rename(lay_id, new_id)
+        except LayoutError as e:
+            return jsonify({"ok": False, "msg": str(e)}), 400
+        touched = task_store.rename_layout(lay_id, new_id)
+        _log.info(f"task layout rename: {lay_id} -> {new_id} (tasks {touched})")
+        return jsonify({"ok": True, "id": new_id, "tasks": touched,
+                        "msg": f"{lay_id} → {new_id}"
+                               + (f"(任务 {', '.join(touched)} 已更新)" if touched else "")})
+
+    @app.post("/task_layout/delete")
+    def task_layout_delete():
+        """Detach a layout from a task; when no other task references it any
+        more, delete its files from the shared layout dir too. Episodes and
+        saved_demo exports that already name the layout are untouched."""
+        body = request.get_json(silent=True) or {}
+        task = (body.get("task_id") or "").strip()
+        lay_id = (body.get("layout_id") or "").strip()
+        if not task or not lay_id:
+            return jsonify({"ok": False, "msg": "task_id and layout_id required"}), 400
+        msg = task_store.remove_layout(task, lay_id)
+        if msg != "removed":
+            return jsonify({"ok": False, "msg": msg}), 404
+        others = task_store.layout_users(lay_id)
+        note = f"layout {lay_id} 已从 {task} 摘掉"
+        if others:
+            note += f";文件保留(仍被 {', '.join(others)} 使用)"
+        elif task_layout_store.exists(lay_id):
+            try:
+                task_layout_store.delete(lay_id)
+                note += ";蒙版文件已删除"
+            except LayoutError as e:
+                note += f";蒙版文件删除失败: {e}"
+        _log.info(f"task layout delete: {task}/{lay_id} — {note}")
+        return jsonify({"ok": True, "task": task, "id": lay_id, "msg": note})
 
     @app.post("/save_ood_layout")
     def save_ood_layout():
@@ -3790,7 +3892,7 @@ def build_app(rs: RS, cams: CamManager, runner: EvalRunner,
         task = (body.get("task") or "").strip()
         if not task:
             return jsonify({"ok": False, "msg": "task required"}), 400
-        pat = re.compile(r"^(?P<base>.+)_r(?P<n>\d+)$")
+        pat = re.compile(r"^(?P<base>.+)_r(?P<n>\d+)(?P<suf>_[TF])?$")
         renamed = []
         for sub in (task, f"{task}-ood"):
             d = pathlib.Path(DEMO_DIR) / sub
@@ -3802,11 +3904,12 @@ def build_app(rs: RS, cams: CamManager, runner: EvalRunner,
                     continue
                 mm = pat.match(jf.stem)
                 if mm:
-                    groups.setdefault(mm.group("base"), []).append((int(mm.group("n")), jf.stem))
+                    groups.setdefault(mm.group("base"), []).append(
+                        (int(mm.group("n")), jf.stem, mm.group("suf") or ""))
             for base, items in groups.items():
                 items.sort()
-                plan = [(old, f"{base}_r{i:02d}") for i, (_n, old) in enumerate(items, 1)
-                        if old != f"{base}_r{i:02d}"]
+                plan = [(old, f"{base}_r{i:02d}{suf}") for i, (_n, old, suf) in enumerate(items, 1)
+                        if old != f"{base}_r{i:02d}{suf}"]
                 if not plan:
                     continue
                 staged = []
