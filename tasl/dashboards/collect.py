@@ -49,6 +49,8 @@ import threading
 import time
 from typing import Optional
 
+from tools.h264_writer import H264Writer  # browser-playable rollout recording
+
 # ── Laptop-compat guards ──────────────────────────────────────────────
 # This module must import cleanly on the dev laptop (macOS, no pyzed/flask)
 # so the pure log parser is unit-testable. Desktop-only deps are flagged.
@@ -590,9 +592,10 @@ class HDRolloutRecorder:
                     tile = ext
             if tile is not None:
                 if writer is None:
-                    writer = cv2.VideoWriter(
-                        path, cv2.VideoWriter_fourcc(*"mp4v"), self.fps,
-                        (tile.shape[1], tile.shape[0]))
+                    # H.264 High + faststart — cv2's default mp4v is not
+                    # browser-playable (see tasl/tools/h264_writer).
+                    writer = H264Writer(
+                        path, self.fps, (tile.shape[1], tile.shape[0]))
                     if not writer.isOpened():
                         _log.error("HD rollout VideoWriter open failed")
                         writer = None
@@ -3980,9 +3983,10 @@ def build_app(cams: CamManager, mgr: CollectionManager,
                         continue
                     frame = _hstack_frames(tiles)
                     if writer is None:
-                        writer = cv2.VideoWriter(
-                            out, cv2.VideoWriter_fourcc(*"mp4v"), fps,
-                            (frame.shape[1], frame.shape[0]))
+                        # H.264 High + faststart — cv2's default mp4v is not
+                        # browser-playable (see tasl/tools/h264_writer).
+                        writer = H264Writer(
+                            out, fps, (frame.shape[1], frame.shape[0]))
                         if not writer.isOpened():
                             return jsonify({"ok": False,
                                             "msg": "VideoWriter open failed"}), 500

@@ -180,6 +180,56 @@ Incremental and resumable; never deletes on the receiving side. `--dry-run`
 to preview, `DEST=…` / `TASL1_HOST=…` to override. TASL2 needs to be on the
 same tailnet (or on campus) — `tailscale ping 100.79.65.37` must answer.
 
+## 5c. Publishing an eval checkpoint's rollouts to the Hub
+
+**Every checkpoint follows the format `cotrain-pbc-v2-8000` established.** One command
+does the whole thing — do not hand-roll it:
+
+```bash
+python tasl/tools/publish_ood_rollouts.py <ckpt-dir> --compare <other-ckpt-dir>
+```
+
+`<ckpt-dir>` is the folder name under `saved_demo/<task>-ood/`, e.g. `pi05-droid-ft-15k`.
+It targets the private dataset repo `TASL-FR3/fr3-ood-rollouts-<ckpt-dir>`.
+
+What it does, in order:
+
+1. **Scan** every `saved_demo/T?-?-ood/<ckpt-dir>/<stem>/<stem>.json` sidecar and derive
+   the Hub row (verdict from `mark`, plus `success` / `unsure` / `timeout` /
+   `suffix_stale` and the parsed `task_group` / `variant` / `ood_index` / `rollout`).
+2. **Encode** each rollout into `web/` as **H.264 High / yuv420p, CRF 26, `-g 30`
+   (2 s keyframes), `+faststart`**, at the source's native 2560×720 / 15 fps.
+   This is not optional: the recorder writes **MPEG-4 Part 2** (`mp4v`) with `moov`
+   *after* `mdat`, which no browser can decode or stream, so the raw files are blank in
+   the Hub preview, the dataset viewer and the Space. The originals are kept alongside.
+3. **Assemble** the upload tree (originals symlinked, `web/` real files),
+   write `metadata.jsonl` with `file_name` → the `web/` copy, and refresh
+   `saved_demo/<ckpt-dir>_ood_stats.xlsx` via `tasl/tools/ood_stats.py`.
+4. **Regenerate** the `<!-- gen:* -->` blocks in `saved_demo/README_<ckpt-dir>_ood.md` —
+   coverage, encoding table, per-task stats, the cross-checkpoint comparison and the
+   full clickable rollout index — then copy it to the repo as `README.md`.
+5. **Upload** with `upload_large_folder` (resumable) and **verify**: every `web/` video is
+   range-fetched from the Hub and checked for H.264 + `moov`-before-`mdat`.
+
+It is **idempotent**. Re-run it after recording more rollouts: already-encoded videos are
+skipped, only the generated blocks are rewritten, and the prose around them is untouched.
+
+Useful flags: `--no-upload` (build locally only), `--verify-only` (just re-check the Hub
+copy), `--jobs N`, `--public`, `--step-cap N`.
+
+### The dataset card
+
+`saved_demo/README_<ckpt-dir>_ood.md` is the source of the Hub card and **is committed**
+(the only exception to the `saved_demo/` gitignore). Hand-written prose lives around the
+markers; anything derived from the data goes *inside* a `<!-- gen:NAME -->` /
+`<!-- /gen:NAME -->` pair so it can never go stale. Available blocks: `summary`,
+`encodings`, `stats`, `compare`, `index`. A checkpoint with no card yet gets a scaffold
+with all the markers already in place.
+
+**Never hand-write a number that the data already knows** — rollout counts, success rates,
+"no rollout was truncated", "4 rollouts are unsure". Those all rotted once already when
+T5-a/T5-b were recorded after the card was written.
+
 ## 6. Quick reference
 
 - **Start / stop:** `sudo ~/RLinf/tasl/launch/eval.sh` · `sudo ~/RLinf/tasl/launch/eval-stop.sh`
@@ -190,6 +240,11 @@ same tailnet (or on campus) — `tailscale ping 100.79.65.37` must answer.
 - **Data:** `/tmp/rlinf_pi05_droid_eval` (LeRobot) inside `rlinf-eval`
 - **Logs:** `~/RLinf/tasl/logs/eval.log` (dashboard) · `_dashboard_eval.log` in-container (eval)
 - **Home pose (rad):** `[0, -0.6283, 0, -2.5133, 0, 1.8850, 0]`
+- **Publish rollouts:** `python tasl/tools/publish_ood_rollouts.py <ckpt-dir> --compare <other>` (§5c) —
+  H.264 `web/` copies + `metadata.jsonl` + stats + README index, idempotent
+- **Stats only:** `python tasl/tools/ood_stats.py <ckpt-dir>` → `saved_demo/<ckpt-dir>_ood_stats.xlsx`
+- **Datasets:** `TASL-FR3/fr3-ood-rollouts-{pi05-droid-ft-15k,cotrain-pbc-v2-8000}` (private) ·
+  Space `axisrobotics/fr3-rollout-browser`
 
 ---
 

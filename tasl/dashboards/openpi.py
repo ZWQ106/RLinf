@@ -61,6 +61,7 @@ from PIL import Image
 
 from clients.droid_client import ControllerNotResponding, DroidLikeClient
 from rtc import dashboard_hook as _rtc_hook  # real-time chunking (tasl/rtc/), opt-in
+from tools.h264_writer import H264Writer  # browser-playable rollout recording
 
 # Image preprocessing modes — MUST match how the checkpoint's data was built:
 #   "pad"  : aspect-preserving resize + zero-pad to 224² (openpi_client
@@ -1600,9 +1601,11 @@ class EvalRecorder:
             if tile is not None:
                 with self._lock:
                     if self._writer is None:
-                        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                        self._writer = cv2.VideoWriter(
-                            str(self.out_dir / "video.mp4"), fourcc,
+                        # H.264 High + faststart, never cv2's default mp4v:
+                        # mp4v recordings are unplayable in every browser and
+                        # in the Hub dataset viewer (see tasl/tools/h264_writer).
+                        self._writer = H264Writer(
+                            str(self.out_dir / "video.mp4"),
                             self.fps, (tile.shape[1], tile.shape[0]))
                         if not self._writer.isOpened():
                             _log.error("VideoWriter open failed — recording off")

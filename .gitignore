@@ -25,8 +25,13 @@ PKG-INFO
 # Collected LeRobot datasets + SVO archives (data, never commit)
 datasets/
 
-# Demo exports from the dashboards' save-video / save-layout buttons
-saved_demo/
+# Demo exports from the dashboards' save-video / save-layout buttons.
+# The videos/sidecars/workbooks are data and never committed, but the dataset
+# cards are documentation: they carry the hand-written prose and the
+# <!-- gen:* --> markers that tasl/tools/publish_ood_rollouts.py fills in, so
+# they must survive in git.
+saved_demo/*
+!saved_demo/README_*.md
 
 # Rollout videos + meta written by the openpi portal (pulled by TASL2 via
 # tasl/launch/pull_demos_from_tasl1.sh — never commit)
