@@ -34,6 +34,14 @@ configs:
   below. The portal now renames on re-mark, so this won't recur. Always filter on `success` /
   `mark`, never on the stem.
 
+> **Abandoned runs are not in this dataset.** The portal's `unsure` mark means the
+> operator stopped the rollout and threw it away — the policy never reached a verdict,
+> so it is not an evaluation data point. Those rollouts are excluded from
+> `metadata.jsonl`, the statistics and the index below. Their files (`mp4`,
+> `traj.jsonl`, `frames.json`, `json`) are still in the repo if you need the raw
+> recording. Note that a rollout which ran into the **1200-step cap is a `fail`**, not
+> an `unsure` — the cap is a failure to finish, and is flagged `timeout: true`.
+
 ## Browsing the rollouts
 
 ### Space (works today)
@@ -131,7 +139,8 @@ One directory per rollout, `<task>-ood/<stem>/<stem>.{mp4,traj.jsonl,frames.json
 `rollouts` (one row per rollout); the same numbers are in the shared sheet:
 https://docs.google.com/spreadsheets/d/1J_CD5HYlcdYnrfNVtSUw6h_0DI_9c-sIh03hflh5QMA/edit?gid=467699410#gid=467699410
 
-`unsure` rollouts are excluded from `n` and `SR %`.
+Every row here is a completed evaluation: runs the operator stopped and abandoned
+(`unsure`) are not policy verdicts and are excluded from the dataset (see above).
 
 <!-- gen:stats -->
 | task | prompt | n | SR % | steps mean | time mean s |
@@ -209,7 +218,7 @@ generated blocks is left alone.
 <!-- gen:index -->
 All 206 rollouts, grouped by task. Each link opens the browser-playable copy under `web/` on the Hub (you must be signed in — the repo is private).
 
-Verdicts come from `mark`; ❓ unsure rollouts are excluded from the success rates above, ⏱ marks a rollout that hit the step cap, ⚠️ one whose filename suffix is stale.
+Verdicts come from `mark`, never the filename suffix. ⏱ marks a rollout that hit the step cap (a capped run is a failure, not a separate outcome), ⚠️ one whose filename suffix is stale. Runs the operator stopped and abandoned (`unsure`) are not evaluation data points and are not listed.
 
 <details>
 <summary><b>T1-a</b> — <i>pick up the blue cup and place it into the red cup</i> — <b>15/20</b> (75%)</summary>

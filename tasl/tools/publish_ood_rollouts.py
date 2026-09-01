@@ -340,9 +340,10 @@ def render_index(records: list[dict], repo_id: str) -> str:
         "browser-playable copy under `web/` on the Hub (you must be signed in — "
         "the repo is private).",
         "",
-        "Verdicts come from `mark`; ❓ unsure rollouts are excluded from the success "
-        "rates above, ⏱ marks a rollout that hit the step cap, ⚠️ one whose filename "
-        "suffix is stale.",
+        "Verdicts come from `mark`, never the filename suffix. ⏱ marks a rollout that "
+        "hit the step cap (a capped run is a failure, not a separate outcome), ⚠️ one "
+        "whose filename suffix is stale. Runs the operator stopped and abandoned "
+        "(`unsure`) are not evaluation data points and are not listed.",
         "",
     ]
     for task, group in _tasks(records):
@@ -658,6 +659,23 @@ def main() -> None:
         raise SystemExit(f"no rollouts found for {ckpt} under {root}")
     tasks = sorted({r["task"] for r in records})
     print(f"  {len(records)} rollouts over {len(tasks)} tasks: {', '.join(tasks)}")
+
+    # `unsure` marks a run the operator stopped and abandoned — the policy never
+    # got a verdict, so it is not an evaluation data point. A run that hit the
+    # step cap is a *failure*, not an unsure, so nothing legitimate is lost here.
+    # The files stay in the repo (and out of the orphan check); only the rows go.
+    published = [r for r in records if not r["unsure"]]
+    dropped_unsure = [r["stem"] for r in records if r["unsure"]]
+    if dropped_unsure:
+        print(f"  excluding {len(dropped_unsure)} abandoned (unsure) rollout(s) from "
+              f"metadata/stats/index, files retained: {', '.join(dropped_unsure)}")
+    mismarked = [r["stem"] for r in records if r["timeout"] and r["mark"] != "fail"]
+    if mismarked:
+        print(f"  !! {len(mismarked)} rollout(s) hit the {args.step_cap}-step cap but are "
+              f"not marked fail: {', '.join(mismarked)}", file=sys.stderr)
+        print("     a capped rollout never finished the task — re-mark it in the portal",
+              file=sys.stderr)
+
     for flag in ("timeout", "suffix_stale", "unsure"):
         hits = [r["stem"] for r in records if r[flag]]
         if hits:
@@ -695,22 +713,27 @@ def main() -> None:
 
     meta_path = os.path.join(stage, "metadata.jsonl")
     with open(meta_path, "w") as fh:
-        for r in records:
+        for r in published:
             fh.write(json.dumps(r, ensure_ascii=False) + "\n")
 
     xlsx_name = f"{ckpt}_ood_stats.xlsx"
-    sidecars = ood_stats.load_sidecars(ckpt, root)
+    # The workbook is part of the published stats, so it gets the same rows the
+    # dataset does. (`ood_stats.py` run on its own still reports the abandoned
+    # runs, which is what you want when auditing the raw recordings.)
+    sidecars = [r for r in ood_stats.load_sidecars(ckpt, root)
+                if r.get("mark") != "unsure"]
     ood_stats.write_xlsx(os.path.join(root, xlsx_name), [
         ("per-task", ood_stats.PER_TASK_COLS, ood_stats.per_task_rows(sidecars)),
         ("rollouts", ood_stats.ROLLOUT_COLS, ood_stats.rollout_rows(sidecars)),
     ])
     shutil.copy(os.path.join(root, xlsx_name), os.path.join(stage, xlsx_name))
-    print(f"  metadata.jsonl ({len(records)} rows), {xlsx_name}")
+    print(f"  metadata.jsonl ({len(published)} rows), {xlsx_name}")
 
     other_records: list[dict] = []
     if args.compare:
-        other_records = sorted(build_records(args.compare, root, args.step_cap),
-                               key=sort_key)
+        other_records = [r for r in sorted(build_records(args.compare, root,
+                                                            args.step_cap), key=sort_key)
+                         if not r["unsure"]]
         if not other_records:
             print(f"  !! --compare {args.compare}: no rollouts on disk, "
                   f"comparison table will be empty", file=sys.stderr)
@@ -727,14 +750,14 @@ def main() -> None:
                    if r["file_name"] not in reuse])
               + sum(remote_sizes.get(p, 0) for p in reuse) / 1e9)
     blocks = [
-        ("summary", render_summary(records, src_gb)),
+        ("summary", render_summary(published, src_gb)),
         ("encodings", render_encodings(src_gb, web_gb)),
-        ("stats", render_stats(records)),
-        ("index", render_index(records, repo_id)),
+        ("stats", render_stats(published)),
+        ("index", render_index(published, repo_id)),
     ]
     if args.compare:
         blocks.append(
-            ("compare", render_compare(records, other_records, ckpt, args.compare)))
+            ("compare", render_compare(published, other_records, ckpt, args.compare)))
     for name, payload in blocks:
         # "unchanged" is the normal case on a re-run, so test for the marker
         # itself rather than inferring its absence from the text not moving.

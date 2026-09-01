@@ -31,7 +31,7 @@ real Franka FR3 bench, recorded through the eval portal (`tasl/dashboards/openpi
 - **ckpt:** `cotrain_pbc_v2/8000 +rtc` — served as `pi05_cotrain_franka_serve`
   (action_horizon 15), co-trained on the center-cropped 250ep-pbc + filtered pbc-v2 sets,
   step 8000, served **with RTC** (real-time chunking, arXiv:2506.07339).
-- **Coverage:** <!-- gen:summary -->**205 rollouts / 4.4 GB** over **10 tasks** (T1-a … T5-b), ~2 rollouts per OOD layout, recorded 2026-08-30 … 2026-08-31. **87/201 succeeded (43.3%)**; 4 marked `unsure` and excluded from the rates.<!-- /gen:summary -->
+- **Coverage:** <!-- gen:summary -->**201 rollouts / 4.4 GB** over **10 tasks** (T1-a … T5-b), ~2 rollouts per OOD layout, recorded 2026-08-30 … 2026-08-31. **87/201 succeeded (43.3%)**.<!-- /gen:summary -->
 - **Files:** `<task>-ood/<layout>_rNN_<T|F|Q>/<same stem>.{mp4,traj.jsonl,frames.json,json}`
   (one folder per rollout), mirroring `saved_demo/<task>-ood/cotrain-pbc-v2-8000/` on disk
   minus the checkpoint level.
@@ -41,11 +41,19 @@ real Franka FR3 bench, recorded through the eval portal (`tasl/dashboards/openpi
     inference latency, and the predicted action chunk
   - `.json` — episode sidecar (task, prompt, layout, ckpt, timings, `steps`, `mark`)
 - **Verdict** comes from `mark` in the sidecar json, **not** the filename suffix.
-  `success` / `fail` / `unsure` map to the `_T` / `_F` / `_Q` stems. `unsure` rollouts are
-  excluded from every success-rate denominator — filter on `not unsure`, never on `not success`.
+  `success` / `fail` map to the `_T` / `_F` stems. A rollout that hit the step cap is a
+  **failure**, not a separate outcome.
 - `steps` = policy control steps at 15 Hz, capped at **1200** by the eval runner. Rollouts at
   the cap are timeouts (`timeout: true`) and are marked ⏱ in the index below; their step and
   time figures are censored.
+
+> **Abandoned runs are not in this dataset.** The portal's `unsure` mark means the
+> operator stopped the rollout and threw it away — the policy never reached a verdict,
+> so it is not an evaluation data point. Those rollouts are excluded from
+> `metadata.jsonl`, the statistics and the index below. Their files (`mp4`,
+> `traj.jsonl`, `frames.json`, `json`) are still in the repo if you need the raw
+> recording. Note that a rollout which ran into the **1200-step cap is a `fail`**, not
+> an `unsure` — the cap is a failure to finish, and is flagged `timeout: true`.
 
 ## Browsing the rollouts
 
@@ -102,7 +110,7 @@ Beyond the raw sidecar fields:
 | `file_name` | relative path to the **`web/`** mp4 — links the row to its video for the viewer |
 | `source_video` | relative path to the original `mp4v` recording |
 | `success` | `mark == "success"` |
-| `unsure` | `mark == "unsure"` — **excluded from every success-rate denominator**, so filter on `not unsure` rather than treating `not success` as failure |
+| `success` | `mark == "success"`; **use this, not the filename suffix** |
 | `timeout` | `steps >= 1200` (the eval-runner cap): the rollout was cut off, not finished |
 | `suffix_stale` | filename `_T`/`_F`/`_Q` suffix disagrees with `mark` — always trust `mark` |
 | `task_group`, `variant`, `ood_index`, `rollout` | parsed out of the stem for grouping/filtering |
@@ -115,8 +123,8 @@ Beyond the raw sidecar fields:
 and `rollouts` (one row per rollout). `metadata.jsonl` carries the same sidecars, one JSON
 object per line, so the dataset can be indexed without opening every small file.
 
-`unsure` rollouts are excluded from `n`, `SR %` and the step/time statistics, and counted in
-the trailing `unsure` column.
+Every row here is a completed evaluation: runs the operator stopped and abandoned
+(`unsure`) are not policy verdicts and are excluded from the dataset (see above).
 
 <!-- gen:stats -->
 | task | prompt | n | SR % | steps mean | time mean s |
@@ -173,9 +181,9 @@ hand-written prose around the generated blocks is left alone.
 ## Rollout index
 
 <!-- gen:index -->
-All 205 rollouts, grouped by task. Each link opens the browser-playable copy under `web/` on the Hub (you must be signed in — the repo is private).
+All 201 rollouts, grouped by task. Each link opens the browser-playable copy under `web/` on the Hub (you must be signed in — the repo is private).
 
-Verdicts come from `mark`; ❓ unsure rollouts are excluded from the success rates above, ⏱ marks a rollout that hit the step cap, ⚠️ one whose filename suffix is stale.
+Verdicts come from `mark`, never the filename suffix. ⏱ marks a rollout that hit the step cap (a capped run is a failure, not a separate outcome), ⚠️ one whose filename suffix is stale. Runs the operator stopped and abandoned (`unsure`) are not evaluation data points and are not listed.
 
 <details>
 <summary><b>T1-a</b> — <i>pick up the blue cup and place it into the red cup</i> — <b>13/20</b> (65%)</summary>
@@ -290,14 +298,12 @@ Verdicts come from `mark`; ❓ unsure rollouts are excluded from the success rat
 </details>
 
 <details>
-<summary><b>T3-a</b> — <i>align the three colored blocks to the same orientation</i> — <b>11/20</b> (55%, 3 unsure)</summary>
+<summary><b>T3-a</b> — <i>align the three colored blocks to the same orientation</i> — <b>11/20</b> (55%)</summary>
 
 | rollout | verdict | steps | duration | video |
 |---|---|---:|---:|---|
-| `T3-a-OOD1_r01` | ❓ unsure | 81 | 21.6 s | [▶ play](https://huggingface.co/datasets/TASL-FR3/fr3-ood-rollouts-cotrain-pbc-v2-8000/blob/main/web/T3-a-ood/T3-a-OOD1_r01_Q/T3-a-OOD1_r01_Q.mp4) |
 | `T3-a-OOD1_r02` | ✅ success | 65 | 17.3 s | [▶ play](https://huggingface.co/datasets/TASL-FR3/fr3-ood-rollouts-cotrain-pbc-v2-8000/blob/main/web/T3-a-ood/T3-a-OOD1_r02_T/T3-a-OOD1_r02_T.mp4) |
 | `T3-a-OOD1_r03` | ✅ success | 73 | 19.2 s | [▶ play](https://huggingface.co/datasets/TASL-FR3/fr3-ood-rollouts-cotrain-pbc-v2-8000/blob/main/web/T3-a-ood/T3-a-OOD1_r03_T/T3-a-OOD1_r03_T.mp4) |
-| `T3-a-OOD2_r01` | ❓ unsure | 36 | 9.3 s | [▶ play](https://huggingface.co/datasets/TASL-FR3/fr3-ood-rollouts-cotrain-pbc-v2-8000/blob/main/web/T3-a-ood/T3-a-OOD2_r01_Q/T3-a-OOD2_r01_Q.mp4) |
 | `T3-a-OOD2_r02` | ✅ success | 104 | 27.5 s | [▶ play](https://huggingface.co/datasets/TASL-FR3/fr3-ood-rollouts-cotrain-pbc-v2-8000/blob/main/web/T3-a-ood/T3-a-OOD2_r02_T/T3-a-OOD2_r02_T.mp4) |
 | `T3-a-OOD2_r03` | ❌ fail | 142 | 37.5 s | [▶ play](https://huggingface.co/datasets/TASL-FR3/fr3-ood-rollouts-cotrain-pbc-v2-8000/blob/main/web/T3-a-ood/T3-a-OOD2_r03_F/T3-a-OOD2_r03_F.mp4) |
 | `T3-a-OOD3_r01` | ❌ fail | 183 | 48.7 s | [▶ play](https://huggingface.co/datasets/TASL-FR3/fr3-ood-rollouts-cotrain-pbc-v2-8000/blob/main/web/T3-a-ood/T3-a-OOD3_r01_F/T3-a-OOD3_r01_F.mp4) |
@@ -308,7 +314,6 @@ Verdicts come from `mark`; ❓ unsure rollouts are excluded from the success rat
 | `T3-a-OOD5_r02` | ✅ success | 97 | 25.8 s | [▶ play](https://huggingface.co/datasets/TASL-FR3/fr3-ood-rollouts-cotrain-pbc-v2-8000/blob/main/web/T3-a-ood/T3-a-OOD5_r02_T/T3-a-OOD5_r02_T.mp4) |
 | `T3-a-OOD6_r01` | ✅ success | 101 | 26.7 s | [▶ play](https://huggingface.co/datasets/TASL-FR3/fr3-ood-rollouts-cotrain-pbc-v2-8000/blob/main/web/T3-a-ood/T3-a-OOD6_r01_T/T3-a-OOD6_r01_T.mp4) |
 | `T3-a-OOD6_r02` | ✅ success | 54 | 14.1 s | [▶ play](https://huggingface.co/datasets/TASL-FR3/fr3-ood-rollouts-cotrain-pbc-v2-8000/blob/main/web/T3-a-ood/T3-a-OOD6_r02_T/T3-a-OOD6_r02_T.mp4) |
-| `T3-a-OOD7_r01` | ❓ unsure | 180 | 47.7 s | [▶ play](https://huggingface.co/datasets/TASL-FR3/fr3-ood-rollouts-cotrain-pbc-v2-8000/blob/main/web/T3-a-ood/T3-a-OOD7_r01_Q/T3-a-OOD7_r01_Q.mp4) |
 | `T3-a-OOD7_r02` | ❌ fail | 222 | 58.9 s | [▶ play](https://huggingface.co/datasets/TASL-FR3/fr3-ood-rollouts-cotrain-pbc-v2-8000/blob/main/web/T3-a-ood/T3-a-OOD7_r02_F/T3-a-OOD7_r02_F.mp4) |
 | `T3-a-OOD7_r03` | ❌ fail | 174 | 46.1 s | [▶ play](https://huggingface.co/datasets/TASL-FR3/fr3-ood-rollouts-cotrain-pbc-v2-8000/blob/main/web/T3-a-ood/T3-a-OOD7_r03_F/T3-a-OOD7_r03_F.mp4) |
 | `T3-a-OOD8_r01` | ✅ success | 211 | 56.0 s | [▶ play](https://huggingface.co/datasets/TASL-FR3/fr3-ood-rollouts-cotrain-pbc-v2-8000/blob/main/web/T3-a-ood/T3-a-OOD8_r01_T/T3-a-OOD8_r01_T.mp4) |
@@ -321,7 +326,7 @@ Verdicts come from `mark`; ❓ unsure rollouts are excluded from the success rat
 </details>
 
 <details>
-<summary><b>T3-b</b> — <i>rotate the red block so that it is perpendicular to the blue block</i> — <b>7/21</b> (33%, 1 unsure)</summary>
+<summary><b>T3-b</b> — <i>rotate the red block so that it is perpendicular to the blue block</i> — <b>7/21</b> (33%)</summary>
 
 | rollout | verdict | steps | duration | video |
 |---|---|---:|---:|---|
@@ -338,7 +343,6 @@ Verdicts come from `mark`; ❓ unsure rollouts are excluded from the success rat
 | `T3-b-OOD5_r02` | ✅ success | 217 | 57.6 s | [▶ play](https://huggingface.co/datasets/TASL-FR3/fr3-ood-rollouts-cotrain-pbc-v2-8000/blob/main/web/T3-b-ood/T3-b-OOD5_r02_T/T3-b-OOD5_r02_T.mp4) |
 | `T3-b-OOD6_r01` | ❌ fail | 499 | 133.1 s | [▶ play](https://huggingface.co/datasets/TASL-FR3/fr3-ood-rollouts-cotrain-pbc-v2-8000/blob/main/web/T3-b-ood/T3-b-OOD6_r01_F/T3-b-OOD6_r01_F.mp4) |
 | `T3-b-OOD6_r02` | ❌ fail | 229 | 60.8 s | [▶ play](https://huggingface.co/datasets/TASL-FR3/fr3-ood-rollouts-cotrain-pbc-v2-8000/blob/main/web/T3-b-ood/T3-b-OOD6_r02_F/T3-b-OOD6_r02_F.mp4) |
-| `T3-b-OOD7_r01` | ❓ unsure | 136 | 36.0 s | [▶ play](https://huggingface.co/datasets/TASL-FR3/fr3-ood-rollouts-cotrain-pbc-v2-8000/blob/main/web/T3-b-ood/T3-b-OOD7_r01_Q/T3-b-OOD7_r01_Q.mp4) |
 | `T3-b-OOD7_r02` | ❌ fail | 258 | 68.5 s | [▶ play](https://huggingface.co/datasets/TASL-FR3/fr3-ood-rollouts-cotrain-pbc-v2-8000/blob/main/web/T3-b-ood/T3-b-OOD7_r02_F/T3-b-OOD7_r02_F.mp4) |
 | `T3-b-OOD7_r03` | ❌ fail | 115 | 30.7 s | [▶ play](https://huggingface.co/datasets/TASL-FR3/fr3-ood-rollouts-cotrain-pbc-v2-8000/blob/main/web/T3-b-ood/T3-b-OOD7_r03_F/T3-b-OOD7_r03_F.mp4) |
 | `T3-b-OOD8_r01` | ❌ fail | 177 | 46.9 s | [▶ play](https://huggingface.co/datasets/TASL-FR3/fr3-ood-rollouts-cotrain-pbc-v2-8000/blob/main/web/T3-b-ood/T3-b-OOD8_r01_F/T3-b-OOD8_r01_F.mp4) |
