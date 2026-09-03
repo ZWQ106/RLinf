@@ -75,6 +75,11 @@ env:
       camera_type: zed
       gripper_type: robotiq
       gripper_connection: "/dev/ttyUSB0"
+      # Capture at 720p30 and publish JPEGs (fork patch) so the operator's
+      # headset can watch the env's own ZED: rteleop.xr.server --source zmq.
+      camera_resolution: [1280, 720]
+      camera_fps: 30
+      camera_stream_addr: "tcp://127.0.0.1:5561"
 
       # Reset: DROID home joints and its measured FK (validated on this arm).
       joint_reset_qpos: [0.0, -0.6283, 0.0, -2.5133, 0.0, 1.8850, 0.0]

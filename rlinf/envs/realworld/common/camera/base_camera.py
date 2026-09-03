@@ -37,6 +37,11 @@ class CameraInfo:
     fps: int = 15
     enable_depth: bool = False
     crop_region: Optional[tuple[float, float, float, float]] = None
+    # Optional live view: every captured frame is JPEG-encoded and published
+    # on this ZeroMQ PUB address (multipart: camera name, jpeg bytes) so a
+    # viewer (e.g. an XR headset) can watch the same camera the env owns.
+    stream_addr: Optional[str] = None
+    stream_jpeg_quality: int = 75
 
 
 class BaseCamera(ABC):
@@ -55,6 +60,7 @@ class BaseCamera(ABC):
             target=self._capture_frames, daemon=True
         )
         self._frame_capturing_start = False
+        self._stream_pub = None
 
     @property
     def name(self) -> str:
@@ -62,6 +68,18 @@ class BaseCamera(ABC):
 
     def open(self):
         """Start the background frame-capturing thread."""
+        if self._camera_info.stream_addr:
+            import zmq
+
+            ctx = zmq.Context.instance()
+            self._stream_pub = ctx.socket(zmq.PUB)
+            self._stream_pub.setsockopt(zmq.SNDHWM, 2)
+            self._stream_pub.setsockopt(zmq.LINGER, 0)
+            # Several cameras share one address: bind once, others connect.
+            try:
+                self._stream_pub.bind(self._camera_info.stream_addr)
+            except zmq.ZMQError:
+                self._stream_pub.connect(self._camera_info.stream_addr)
         self._frame_capturing_start = True
         self._frame_capturing_thread.start()
 
@@ -69,6 +87,9 @@ class BaseCamera(ABC):
         """Stop the capture thread and release hardware resources."""
         self._frame_capturing_start = False
         self._close_device()
+        if self._stream_pub is not None:
+            self._stream_pub.close()
+            self._stream_pub = None
         if self._frame_capturing_thread.is_alive():
             self._frame_capturing_thread.join(timeout=2.0)
 
@@ -110,6 +131,26 @@ class BaseCamera(ABC):
                 except queue.Empty:
                     pass
             self._frame_queue.put(frame)
+            if self._stream_pub is not None:
+                self._publish_frame(frame)
+
+    def _publish_frame(self, frame: np.ndarray) -> None:
+        import cv2
+        import zmq
+
+        ok, jpg = cv2.imencode(
+            ".jpg",
+            frame,
+            [cv2.IMWRITE_JPEG_QUALITY, self._camera_info.stream_jpeg_quality],
+        )
+        if not ok:
+            return
+        try:
+            self._stream_pub.send_multipart(
+                [self._camera_info.name.encode(), jpg.tobytes()], zmq.NOBLOCK
+            )
+        except zmq.Again:
+            pass
 
     @abstractmethod
     def _read_frame(self) -> tuple[bool, Optional[np.ndarray]]:

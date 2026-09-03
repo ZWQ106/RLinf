@@ -55,6 +55,11 @@ class FrankaRobotConfig:
     # Each value is [top%, left%, bottom%, right%] in 0..1 range.
     # Example: {"230322271990": [0.0, 0.15, 1.0, 0.85]}
     camera_crop_regions: Optional[dict[str, list[float]]] = None
+    # Capture settings applied to every camera (CameraInfo defaults otherwise).
+    camera_resolution: Optional[list[int]] = None
+    camera_fps: Optional[int] = None
+    # Live JPEG stream of every camera over ZeroMQ PUB (see CameraInfo.stream_addr).
+    camera_stream_addr: Optional[str] = None
 
     is_dummy: bool = False
     use_dense_reward: bool = False
@@ -677,12 +682,20 @@ class FrankaEnv(gym.Env):
                     serial=serial,
                 )
 
+            camera_kwargs = {}
+            if self.config.camera_resolution is not None:
+                camera_kwargs["resolution"] = tuple(self.config.camera_resolution)
+            if self.config.camera_fps is not None:
+                camera_kwargs["fps"] = int(self.config.camera_fps)
+            if self.config.camera_stream_addr:
+                camera_kwargs["stream_addr"] = self.config.camera_stream_addr
             camera_infos.append(
                 CameraInfo(
                     name=name,
                     serial_number=serial,
                     camera_type=default_camera_type,
                     crop_region=crop_region,
+                    **camera_kwargs,
                 )
             )
 
