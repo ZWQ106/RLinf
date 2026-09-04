@@ -159,13 +159,23 @@ def apply_single_arm_jointvel_wrappers(env: gym.Env, cfg: Mapping[str, Any]) -> 
             raise ValueError(
                 "FrankaJointVelEnv requires 'gello_port' in the env config."
             )
-        env = GelloJointIntervention(
-            env,
+        gello_kwargs = dict(
             port=gello_port,
             kp=float(cfg.get("gello_kp", 4.0)),
             vmax=float(cfg.get("gello_vmax", 1.0)),
             gripper_enabled=not cfg.get("no_gripper", False),
         )
+        leader_delay = cfg.get("leader_delay", None)
+        if leader_delay:
+            # Remote-teleop study: emulated operator->robot delay on the leader
+            # stream (see delayed_gello_joint_intervention.py).
+            from rlinf.envs.realworld.common.wrappers.delayed_gello_joint_intervention import (
+                DelayedGelloJointIntervention,
+            )
+
+            env = DelayedGelloJointIntervention(env, **gello_kwargs, **dict(leader_delay))
+        else:
+            env = GelloJointIntervention(env, **gello_kwargs)
     env = _apply_keyboard_reward(
         env,
         cfg.get("keyboard_reward_wrapper", None),
