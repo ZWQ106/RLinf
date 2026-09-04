@@ -82,6 +82,7 @@ env:
       success_hold_steps: 1
       obs_image_size: 224
       camera_stream_addr: "tcp://127.0.0.1:5561"
+      camera_stream_names: ["wrist_1"]   # exterior ZED 2i only (operator view)
       camera_fps: 30          # HD720@30 for the operator view (dataset stays 15 Hz)
 
     data_collection:

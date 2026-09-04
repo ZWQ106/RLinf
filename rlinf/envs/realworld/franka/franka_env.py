@@ -62,6 +62,9 @@ class FrankaRobotConfig:
     camera_fps: Optional[int] = None
     # Live JPEG stream of every camera over ZeroMQ PUB (CameraInfo.stream_addr).
     camera_stream_addr: Optional[str] = None
+    # Only these camera names are streamed (None = all). Encoding runs in the
+    # env process, so stream just what the operator watches.
+    camera_stream_names: Optional[list[str]] = None
     # Square H/W of the observation/training frames after crop+resize.
     # pi0/pi05 resize to 224 internally; 224 is the no-loss/no-waste default.
     # Default 128 preserves the existing eval-path behavior.
@@ -734,7 +737,10 @@ class FrankaEnv(gym.Env):
                 ci_kwargs["resolution"] = tuple(self.config.camera_resolution)
             if self.config.camera_fps is not None:
                 ci_kwargs["fps"] = int(self.config.camera_fps)
-            if self.config.camera_stream_addr:
+            if self.config.camera_stream_addr and (
+                self.config.camera_stream_names is None
+                or name in self.config.camera_stream_names
+            ):
                 ci_kwargs["stream_addr"] = self.config.camera_stream_addr
             camera_infos.append(CameraInfo(**ci_kwargs))
 
