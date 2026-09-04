@@ -844,7 +844,9 @@ class CollectionManager:
             # keep the ZEDs + GELLO held and wedge the new run ("refused" / the
             # env's camera open() failing). This makes start idempotent.
             self._kill_orphan_collection()
-            self._kill_legacy_dashboard()
+            # Latency study runs beside the lab's dashboards: never SIGTERM them.
+            if os.environ.get("RLINF_KILL_OTHER_DASHBOARDS", "1") == "1":
+                self._kill_legacy_dashboard()
 
             # RLinf env needs exclusive ZED access — release ours first.
             # cams.stop() closes the sl.Camera handles synchronously, but the
