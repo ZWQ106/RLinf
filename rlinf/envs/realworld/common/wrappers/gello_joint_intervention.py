@@ -41,7 +41,11 @@ def compute_joint_velocity_action(
     q_gello = np.asarray(q_gello, dtype=np.float64).reshape(-1)
     q_robot = np.asarray(q_robot, dtype=np.float64).reshape(-1)
     assert q_gello.shape == (7,) and q_robot.shape == (7,)
-    v = np.clip(kp * (q_gello - q_robot), -vmax, vmax)
+    # Wrap the joint error to [-pi, pi): the leader's Dynamixel readings can
+    # come back shifted by a full turn (e.g. 5.94 rad for -0.34 rad), which
+    # otherwise saturates the P-controller and drives the robot away.
+    err = (q_gello - q_robot + np.pi) % (2.0 * np.pi) - np.pi
+    v = np.clip(kp * err, -vmax, vmax)
     grip = float(np.clip(gripper, 0.0, 1.0))
     return np.concatenate([v, [grip]]).astype(np.float64)
 

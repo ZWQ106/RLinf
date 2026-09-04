@@ -142,6 +142,10 @@ class DelayedGelloJointIntervention(GelloJointIntervention):
         playout_s: playout buffer for ``queued``.
         sample_hz: leader sampling rate of the background thread.
         seed: RNG seed for the jitter draw (recorded in ``info["leader_delay"]``).
+        match_tolerance_rad: pose-match gate — no motion until every leader
+            joint is within this of the robot (wrapped error) once; the
+            per-joint mismatch is logged every second meanwhile. Prevents the
+            lunge when the leader rests far from the robot's home pose.
     """
 
     def __init__(
@@ -158,6 +162,7 @@ class DelayedGelloJointIntervention(GelloJointIntervention):
         playout_s: float = 0.05,
         sample_hz: float = 50.0,
         seed: Optional[int] = 0,
+        match_tolerance_rad: float = 0.35,
     ):
         super().__init__(env, port, kp=kp, vmax=vmax, gripper_enabled=gripper_enabled)
         assert mode in ("direct", "queued")
@@ -174,6 +179,9 @@ class DelayedGelloJointIntervention(GelloJointIntervention):
             "sample_hz": float(sample_hz),
             "seed": seed,
         }
+        self.match_tolerance_rad = float(match_tolerance_rad)
+        self._matched = False
+        self._last_match_log = 0.0
         self._sampler_stop = threading.Event()
         self._sampler = threading.Thread(target=self._sample_loop, daemon=True)
         self._sampler.start()
@@ -194,6 +202,11 @@ class DelayedGelloJointIntervention(GelloJointIntervention):
         self._sampler_stop.set()
         return super().close()
 
+    def reset(self, **kwargs):
+        # Robot re-homes on reset; the operator must match the pose again.
+        self._matched = False
+        return self.env.reset(**kwargs)
+
     def _leader(self):
         now = time.time()
         if self.mode == "queued":
@@ -212,6 +225,18 @@ class DelayedGelloJointIntervention(GelloJointIntervention):
             self.get_wrapper_attr("get_arm_joint_position")(), dtype=np.float64
         ).reshape(-1)[:7]
         gripper = s.gripper if self.gripper_enabled else 0.0
+        if not self._matched:
+            err = (s.q - q_robot + np.pi) % (2.0 * np.pi) - np.pi
+            if np.all(np.abs(err) <= self.match_tolerance_rad):
+                self._matched = True
+                print("[leader gate] pose matched — teleop live", flush=True)
+            else:
+                if now - self._last_match_log > 1.0:
+                    self._last_match_log = now
+                    print("[leader gate] move GELLO to the robot pose; joint error (rad): "
+                          + np.array2string(err, precision=2, suppress_small=True), flush=True)
+                self._last_delay_info = dict(self._cfg, applied_s=now - s.t_send, arrived=True, matched=False)
+                return action, False
         expert_a = compute_joint_velocity_action(s.q, q_robot, gripper, self.kp, self.vmax)
         self._last_delay_info = dict(self._cfg, applied_s=now - s.t_send, arrived=True)
         if np.linalg.norm(expert_a[:7]) > 0.001 or (
