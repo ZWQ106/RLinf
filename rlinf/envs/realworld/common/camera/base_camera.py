@@ -136,8 +136,10 @@ class BaseCamera(ABC):
         if not ok:
             return
         try:
+            # third part: capture wall time (s) so viewers can report frame age
             self._stream_pub.send_multipart(
-                [self._camera_info.name.encode(), jpg.tobytes()], zmq.NOBLOCK
+                [self._camera_info.name.encode(), jpg.tobytes(), repr(time.time()).encode()],
+                zmq.NOBLOCK,
             )
         except zmq.Again:
             pass

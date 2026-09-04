@@ -59,6 +59,7 @@ class FrankaRobotConfig:
     # ZED capture resolution [width, height], e.g. [1920, 1080] for HD1080.
     # None -> CameraInfo default (VGA). Independent of the obs reshape size.
     camera_resolution: Optional[list[int]] = None
+    camera_fps: Optional[int] = None
     # Live JPEG stream of every camera over ZeroMQ PUB (CameraInfo.stream_addr).
     camera_stream_addr: Optional[str] = None
     # Square H/W of the observation/training frames after crop+resize.
@@ -731,6 +732,8 @@ class FrankaEnv(gym.Env):
             )
             if self.config.camera_resolution is not None:
                 ci_kwargs["resolution"] = tuple(self.config.camera_resolution)
+            if self.config.camera_fps is not None:
+                ci_kwargs["fps"] = int(self.config.camera_fps)
             if self.config.camera_stream_addr:
                 ci_kwargs["stream_addr"] = self.config.camera_stream_addr
             camera_infos.append(CameraInfo(**ci_kwargs))
