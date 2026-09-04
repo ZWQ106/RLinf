@@ -40,6 +40,8 @@ class ZEDCamera(BaseCamera):
     ZED cameras output BGRA by default; this class strips the alpha channel
     to produce BGR, consistent with the RealSense pipeline.
     """
+    BLOCKING_READ = True  # sl.Camera.grab() waits for the next frame
+
 
     def __init__(self, camera_info: CameraInfo):
         import pyzed.sl as sl

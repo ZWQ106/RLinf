@@ -111,9 +111,14 @@ class BaseCamera(ABC):
 
     # ── internal ──────────────────────────────────────────────────────
 
+    # Cameras whose _read_frame blocks until the next frame (ZED grab) must
+    # not sleep a frame period first: that adds up to 1/fps of staleness.
+    BLOCKING_READ = False
+
     def _capture_frames(self):
         while self._frame_capturing_start:
-            time.sleep(1 / self._camera_info.fps)
+            if not self.BLOCKING_READ:
+                time.sleep(1 / self._camera_info.fps)
             has_frame, frame = self._read_frame()
             if not has_frame:
                 break
