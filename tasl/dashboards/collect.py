@@ -122,6 +122,11 @@ SN_EXTERIOR = 36443134   # ZED 2i, exterior view
 SN_WRIST = 17150101      # ZED Mini, wrist-mounted
 
 CONTAINER = os.environ.get("RLINF_CONTAINER", "rlinf-eval")
+# Remote-teleop study: pick the collect config and append hydra overrides
+# (e.g. env.eval.leader_delay.tau_f=0.3) without editing the launch command.
+COLLECT_CONFIG = os.environ.get("RLINF_COLLECT_CONFIG",
+                                "realworld_collect_data_polymetis_jointvel")
+COLLECT_EXTRA = os.environ.get("RLINF_COLLECT_EXTRA", "")
 COLLECT_LOG = "/tmp/collect_dash.log"
 CONTAINER_PY = "/opt/venv/openpi/bin/python"
 # Host side of the bind mount where the in-container VideoPlayer writes live
@@ -924,7 +929,7 @@ class CollectionManager:
                 "HF_LEROBOT_HOME=/workspace/rlinf/outputs/lerobot "
                 f"{kbd_env}&& "
                 f"{CONTAINER_PY} examples/embodiment/collect_real_data.py "
-                "--config-name realworld_collect_data_polymetis_jointvel "
+                f"--config-name {COLLECT_CONFIG} "
                 "env.eval.gello_port=/dev/gello "
                 # Reach the controller over the robot net, not the config's
                 # legacy Tailscale robot_ip (overrides node_groups[0] hardware).
@@ -933,6 +938,7 @@ class CollectionManager:
                 f"runner.logger.log_path={log_path} "
                 f"{override} "
                 f"{ds_override}"
+                f"{COLLECT_EXTRA} "
                 f"> {COLLECT_LOG} 2>&1"
             )
             try:
